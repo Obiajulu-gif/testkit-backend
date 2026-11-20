@@ -127,6 +127,21 @@ read/write counts and transaction size aren't reported (they come from a
 network-side simulated footprint this crate doesn't produce); instructions
 and memory, measured locally, are.
 
+Each probe is killed after `--probe-timeout` seconds (default 30) and
+recorded as `timed-out`, with the ramp value and timeout in its report. Add
+`--timeout <SECONDS>` to bound the whole run: probes wait at most for the
+time left, and a run that hits the deadline fails with the best value
+verified so far instead of reporting an unconfirmed boundary. `--progress`
+prints one line per probe to stderr (phase, value, outcome, best so far,
+elapsed time) without changing stdout or the `--export` JSON. Next to the
+maximum success, the summary reports the last failing probe, with its
+category and first stderr line, as `last_failed_probe` in JSON.
+
+```sh
+soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm \
+  --fn batch_payout --ramp recipients --probe-timeout 10 --timeout 300 --progress
+```
+
 Probe execution uses the already-built `soroban-testkit` executable directly,
 not `cargo run` or a throwaway Cargo project. Each probe child is killed and
 reaped on timeout; an early ordinary error/return also invokes a cleanup

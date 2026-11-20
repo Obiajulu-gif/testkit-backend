@@ -3,8 +3,8 @@
 //! This module owns the `limits` command and the hidden `__limits-probe`
 //! child entry point it spawns. The two halves cooperate through process
 //! isolation, whose full lifecycle is documented on [`run`]; each probe's
-//! result is classified with [`ProbeFailureCategory`] and every report —
-//! human-readable or machine-readable — is rendered from a single
+//! result is classified with [`ProbeFailureCategory`] and every report â
+//! human-readable or machine-readable â is rendered from a single
 //! [`LimitsSummary`] so the formats cannot disagree.
 
 use std::collections::BTreeMap;
@@ -24,6 +24,16 @@ use super::CliError;
 /// Measurement limitations warning reported across stdout and machine-readable outputs.
 pub const MEASUREMENT_LIMITATIONS: &str =
     "ledger reads/writes and transaction size are not measured by this command; see --help";
+
+/// Soroban per-transaction CPU instruction limit on mainnet.
+pub const SOROBAN_CPU_INSN_LIMIT: u64 = 100_000_000;
+
+/// Soroban per-transaction memory limit in bytes on mainnet (40 MiB).
+pub const SOROBAN_MEMORY_LIMIT: u64 = 41_943_040;
+
+/// Help text explaining how to interpret local instruction measurements.
+pub const INSTRUCTION_INTERPRETATION: &str =
+    "instruction counts are Soroban host CPU instructions, not wall-clock time;      one unit is roughly one basic WASM interpreter operation;      the per-transaction ceiling on Stellar mainnet is 100,000,000 instructions;      local measurements omit transaction-envelope overhead and may read      slightly lower than a network simulation of the same call";
 
 /// Built-in upper bound for the doubling search. If the contract still
 /// succeeds here the run stops and reports that the ceiling may be higher,
@@ -53,7 +63,7 @@ pub enum ProbeFailureCategory {
     /// The probe exceeded `--probe-timeout` and was killed by the parent
     /// before it could finish.
     TimedOut,
-    /// The child process was terminated by a signal — the host abort that
+    /// The child process was terminated by a signal â the host abort that
     /// real WASM execution can cause rather than a normal exit. On such a
     /// run the failure is real, but the ramp value reported may reflect the
     /// abort rather than a clean resource boundary.
@@ -103,6 +113,193 @@ impl std::fmt::Display for ProbeFailureCategory {
         write!(f, "{}", self.label())
     }
 }
+/// Which host resource was the binding constraint that stopped the ramp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceBoundary {
+    /// CPU instruction count was closer to its mainnet limit.
+    Instructions,
+    /// Memory bytes was closer to its mainnet limit.
+    Memory,
+    /// Neither resource approached its limit; the ramp was stopped by contract
+    /// logic, the built-in search ceiling, or an indeterminate cause.
+    Other,
+}
+
+impl ResourceBoundary {
+    /// A one-line explanation of what this boundary means for the reported ceiling.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            ResourceBoundary::Instructions => {
+                "CPU instructions were the binding resource; the contract is compute-bound"
+            }
+            ResourceBoundary::Memory => {
+                "memory bytes were the binding resource; the contract is memory-bound"
+            }
+            ResourceBoundary::Other => {
+                "neither resource approached its limit; the ceiling reflects contract logic,                  the built-in search upper bound, or an indeterminate cause"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResourceBoundary::Instructions => write!(f, "instructions"),
+            ResourceBoundary::Memory => write!(f, "memory"),
+            ResourceBoundary::Other => write!(f, "other"),
+        }
+    }
+}
+
+/// A named configuration for a common Soroban batch workload.
+///
+/// Pass via `--preset`. Available presets:
+/// - `batch-payout`   -- `--fn batch_payout --ramp recipients`
+/// - `token-transfer` -- `--fn transfer --ramp amount`
+/// - `multi-mint`     -- `--fn mint --ramp count`
+///
+/// Explicit `--fn`/`--ramp`/`--arg` flags always override the preset's defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RampPreset {
+    /// Targets `batch_payout(recipients, ...)`.
+    BatchPayout,
+    /// Targets `transfer(amount, ...)`.
+    TokenTransfer,
+    /// Targets `mint(count, ...)`.
+    MultiMint,
+}
+
+impl RampPreset {
+    /// Parse a preset name, returning an error listing valid names on failure.
+    pub fn from_name(name: &str) -> Result<Self, CliError> {
+        match name {
+            "batch-payout" => Ok(RampPreset::BatchPayout),
+            "token-transfer" => Ok(RampPreset::TokenTransfer),
+            "multi-mint" => Ok(RampPreset::MultiMint),
+            other => Err(CliError(format!(
+                "unknown preset {other:?}; available presets: batch-payout, token-transfer, multi-mint"
+            ))),
+        }
+    }
+
+    /// The contract function name this preset targets.
+    pub fn function(&self) -> &'static str {
+        match self {
+            RampPreset::BatchPayout => "batch_payout",
+            RampPreset::TokenTransfer => "transfer",
+            RampPreset::MultiMint => "mint",
+        }
+    }
+
+    /// The ramp parameter name this preset uses.
+    pub fn ramp(&self) -> &'static str {
+        match self {
+            RampPreset::BatchPayout => "recipients",
+            RampPreset::TokenTransfer => "amount",
+            RampPreset::MultiMint => "count",
+        }
+    }
+
+    /// Default `NAME=VALUE` arg overrides this preset recommends.
+    pub fn default_args(&self) -> &'static [&'static str] {
+        match self {
+            RampPreset::BatchPayout | RampPreset::TokenTransfer | RampPreset::MultiMint => &[],
+        }
+    }
+}
+
+/// A checked-in resource ceiling for a `limits` run.
+///
+/// Unlike [`Baseline`] (which records a previous run's actual results),
+/// a `ResourceBudget` is a human-authored file specifying the *maximum*
+/// CPU instructions, memory bytes, or *minimum* ramp ceiling the contract must
+/// satisfy. Check one into the repository alongside the contract to guard
+/// against silent resource regressions in CI.
+///
+/// Budget files use a `key=value` text format with optional `#` comment lines.
+/// Every field is optional; omitted fields are not checked.
+///
+/// # Example budget file
+///
+/// ```text
+/// # maximum allowed CPU instructions at the ramp ceiling
+/// max_instructions=60000000
+/// # maximum allowed memory bytes
+/// max_memory_bytes=20000000
+/// # minimum ramp ceiling the contract must sustain
+/// min_best=100
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceBudget {
+    /// Maximum CPU instructions allowed at the discovered ramp ceiling.
+    pub max_instructions: Option<u64>,
+    /// Maximum memory bytes allowed at the discovered ramp ceiling.
+    pub max_memory_bytes: Option<u64>,
+    /// Minimum ramp ceiling the contract must achieve.
+    pub min_best: Option<u32>,
+}
+
+impl ResourceBudget {
+    /// Parse a resource budget from its `key=value` file contents.
+    pub fn parse(contents: &str) -> Result<Self, CliError> {
+        let mut max_instructions = None;
+        let mut max_memory_bytes = None;
+        let mut min_best = None;
+
+        for (line_no, line) in contents.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(CliError(format!(
+                    "malformed budget file at line {}: expected key=value or # comment, got {line:?}",
+                    line_no + 1
+                )));
+            };
+            match key.trim() {
+                "max_instructions" => {
+                    max_instructions = Some(value.trim().parse::<u64>().map_err(|err| {
+                        CliError(format!(
+                            "malformed budget `max_instructions` value {:?}: {err}",
+                            value
+                        ))
+                    })?)
+                }
+                "max_memory_bytes" => {
+                    max_memory_bytes = Some(value.trim().parse::<u64>().map_err(|err| {
+                        CliError(format!(
+                            "malformed budget `max_memory_bytes` value {:?}: {err}",
+                            value
+                        ))
+                    })?)
+                }
+                "min_best" => {
+                    min_best = Some(value.trim().parse::<u32>().map_err(|err| {
+                        CliError(format!(
+                            "malformed budget `min_best` value {:?}: {err}",
+                            value
+                        ))
+                    })?)
+                }
+                other => {
+                    return Err(CliError(format!(
+                        "malformed budget file at line {}: unknown key {other:?};                          valid keys are max_instructions, max_memory_bytes, min_best",
+                        line_no + 1
+                    )))
+                }
+            }
+        }
+
+        Ok(ResourceBudget {
+            max_instructions,
+            max_memory_bytes,
+            min_best,
+        })
+    }
+}
 
 /// The outcome of a single isolated probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +331,56 @@ fn classify_probe_exit_stderr(stderr: &str) -> ProbeFailureCategory {
 }
 
 /// `serde(skip_serializing_if)` helper: omitted for an empty failure map.
+/// The first non-empty line of a probe's stderr, so one-line summaries stay
+/// one line even when a probe prints a multi-line panic message.
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+}
+
 fn map_is_empty<K, V>(map: &BTreeMap<K, V>) -> bool {
     map.is_empty()
+}
+
+/// `serde(skip_serializing_if)` helper: omitted for an empty vec.
+fn vec_is_empty<T>(v: &[T]) -> bool {
+    v.is_empty()
+}
+
+/// The most recent probe that failed during a run (issue #363).
+///
+/// [`LimitsSummary::first_failed`] is the refined boundary, and
+/// [`LimitsSummary::first_failed_probe_stderr`] comes from the *first* probe
+/// that failed chronologically -- usually a doubling probe far above the
+/// boundary. This record is the failing probe that ran last, which after
+/// refinement is the one sitting right above the maximum success, so its
+/// category and stderr explain why the reported ceiling is where it is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FailedProbe {
+    /// The ramp value the probe was run with.
+    pub value: u32,
+    /// Why it failed.
+    pub category: ProbeFailureCategory,
+    /// Stderr captured from that probe (or the timeout note for a killed
+    /// probe), when there was any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+}
+
+/// One recorded probe sample, included in the `--export-samples` output.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProbeSample {
+    pub value: u32,
+    pub succeeded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<ProbeFailureCategory>,
+    /// Wall-clock duration of this probe in milliseconds, measured from spawn
+    /// to result classification. Present for every probe when `--record-probe-duration`
+    /// is set; `None` when the flag is omitted (the default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// The single source of truth for one `limits` run.
@@ -148,8 +393,8 @@ fn map_is_empty<K, V>(map: &BTreeMap<K, V>) -> bool {
 pub struct LimitsSummary {
     /// Sanitized contract path (see [`sanitize_report_path`]).
     pub contract: String,
-    pub function: String,
-    pub ramp: String,
+    pub function: Option<String>,
+    pub ramp: Option<String>,
     /// The highest ramp value that succeeded.
     pub best: u32,
     /// CPU instructions consumed at `best`.
@@ -166,8 +411,12 @@ pub struct LimitsSummary {
     /// actionable context for why the ceiling was hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_failed_probe_stderr: Option<String>,
+    /// The failing probe that ran last, reported alongside `best` (see
+    /// [`FailedProbe`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_probe: Option<FailedProbe>,
     /// How many probes failed in each category over the whole run.
-    #[serde(skip_serializing_if = "map_is_empty")]
+    #[serde(default, skip_serializing_if = "map_is_empty")]
     pub probe_failure_counts: BTreeMap<ProbeFailureCategory, usize>,
     /// Whether the search stopped at [`SEARCH_UPPER_BOUND`] without finding a
     /// failure.
@@ -181,6 +430,26 @@ pub struct LimitsSummary {
     /// Actionable instructions for reproducing the reported maximum locally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reproduction: Option<String>,
+    /// Which host resource was the binding constraint that stopped the ramp.
+    /// Computed from the fraction of Soroban mainnet limits consumed at `best`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<ResourceBoundary>,
+    /// All individual probe samples recorded during the run, in call order.
+    /// Populated only when `--export-samples` is requested.
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub probe_samples: Vec<ProbeSample>,
+    /// Additional parameters ramped in lockstep with the primary ramp.
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub co_ramp: Vec<String>,
+    /// Compiler and WASM-target metadata captured at run time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compiler_meta: Option<CompilerMeta>,
+    /// Custom wasm target directory, when `--wasm-target-dir` was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_target_dir: Option<String>,
+    /// Cargo profile used for the build, when `--profile` was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 impl LimitsSummary {
@@ -188,16 +457,38 @@ impl LimitsSummary {
     /// output is produced, keeping it in lockstep with the JSON export.
     pub fn render_text(&self) -> String {
         let mut out = String::new();
+        let ramp_str = self.ramp.as_deref().unwrap_or("");
+        let function_str = self.function.as_deref().unwrap_or("");
+        let ramp_display = if self.co_ramp.is_empty() {
+            ramp_str.to_string()
+        } else {
+            format!("{} (+ {})", ramp_str, self.co_ramp.join(", "))
+        };
         out.push_str(&format!(
             "last successful {} for {:?}: {}\n",
-            self.ramp, self.function, self.best
+            ramp_display, function_str, self.best
         ));
         out.push_str(&format!("  instructions: {}\n", self.instructions));
         out.push_str(&format!("  memory bytes: {}\n", self.memory_bytes));
         if let Some(failed) = self.first_failed {
-            out.push_str(&format!("  first failed {} value: {failed}", self.ramp));
+            out.push_str(&format!("  first failed {} value: {failed}", ramp_str));
             if let Some(category) = self.first_failure_category {
                 out.push_str(&format!(" [{category}]"));
+            }
+            out.push('\n');
+        }
+        if let Some(last) = &self.last_failed_probe {
+            out.push_str(&format!(
+                "  last failing probe: {}={} [{}]",
+                ramp_str, last.value, last.category
+            ));
+            if let Some(stderr) = last
+                .stderr
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                out.push_str(&format!(": {}", first_line(stderr)));
             }
             out.push('\n');
         }
@@ -227,6 +518,14 @@ impl LimitsSummary {
             ));
         }
         out.push_str(&format!("  ({})\n", self.measurement_limitations));
+        out.push_str(&format!("  ({})\n", INSTRUCTION_INTERPRETATION));
+        if let Some(boundary) = self.stopped_by {
+            out.push_str(&format!(
+                "  resource boundary: {} -- {}\n",
+                boundary,
+                boundary.explanation()
+            ));
+        }
         if let Some(repro) = &self.reproduction {
             out.push_str(&format!("  reproduce locally: {repro}\n"));
         }
@@ -238,6 +537,18 @@ impl LimitsSummary {
                 "  note: a host abort may reflect a contract trap rather than a resource limit; \
                  inspect the function and re-run to confirm\n",
             );
+        }
+        if let Some(meta) = &self.compiler_meta {
+            out.push_str(&format!(
+                "  compiler: {} (target: {})\n",
+                meta.rustc_version, meta.wasm_target
+            ));
+        }
+        if let Some(dir) = &self.wasm_target_dir {
+            out.push_str(&format!("  wasm target dir: {dir}\n"));
+        }
+        if let Some(profile) = &self.profile {
+            out.push_str(&format!("  cargo profile: {profile}\n"));
         }
         if self.hit_upper_bound {
             out.push_str(&format!(
@@ -251,7 +562,7 @@ impl LimitsSummary {
         {
             out.push_str(&format!(
                 "  note: at least one probe was killed for exceeding --probe-timeout ({}s); the \
-                 discovered ceiling may reflect a hang rather than a real resource limit — rerun \
+                 discovered ceiling may reflect a hang rather than a real resource limit â rerun \
                  with a larger --probe-timeout to check\n",
                 self.probe_timeout_secs
             ));
@@ -284,6 +595,165 @@ pub struct RefinementAudit {
     pub final_failure: u32,
 }
 
+/// Compiler and target metadata captured at the start of a `limits` run.
+///
+/// Recorded in [`LimitsSummary`] so results files carry the toolchain context
+/// they were produced with, making regression comparisons across compiler
+/// upgrades auditable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CompilerMeta {
+    /// Output of `rustc --version` at run time.
+    pub rustc_version: String,
+    /// The WASM target triple used for Soroban contracts.
+    pub wasm_target: String,
+}
+
+/// Captures compiler and WASM-target metadata for the current toolchain.
+fn collect_compiler_meta() -> CompilerMeta {
+    let rustc_version = Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    CompilerMeta {
+        rustc_version,
+        wasm_target: "wasm32v1-none".to_string(),
+    }
+}
+
+/// A reusable comparison between a `limits` run and a saved baseline.
+///
+/// Extracted from the private `compare_to_baseline` so callers that need
+/// programmatic access to regression details (CI scripts, test helpers) do
+/// not have to parse human-readable output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaselineComparison {
+    pub ramp: String,
+    pub function: String,
+    pub baseline_best: u32,
+    pub current_best: u32,
+    pub baseline_instructions: u64,
+    pub current_instructions: u64,
+    pub baseline_memory_bytes: u64,
+    pub current_memory_bytes: u64,
+    pub tolerance_pct: f64,
+    regressions: Vec<String>,
+}
+
+impl BaselineComparison {
+    /// Compares `current_*` metrics against `baseline`, applying
+    /// `tolerance_pct` to instruction/memory growth.
+    ///
+    /// Returns an error only when the `function`/`ramp` combination does not
+    /// match the baseline (comparing across different call sites is not
+    /// meaningful).
+    pub fn new(
+        baseline: &Baseline,
+        ramp: &str,
+        function: &str,
+        best: u32,
+        instructions: u64,
+        memory_bytes: u64,
+        tolerance_pct: f64,
+    ) -> Result<Self, CliError> {
+        if baseline.function != function || baseline.ramp != ramp {
+            return Err(CliError(format!(
+                "baseline was recorded for {:?}/{:?}, not {function:?}/{ramp:?}; comparing \
+                 across different functions or ramp parameters isn't meaningful",
+                baseline.function, baseline.ramp
+            )));
+        }
+        let mut regressions = Vec::new();
+        if best < baseline.best {
+            regressions.push(format!(
+                "{ramp} ceiling dropped from {} to {best}",
+                baseline.best
+            ));
+        }
+        Self::check_metric(
+            "instructions",
+            baseline.instructions,
+            instructions,
+            tolerance_pct,
+            &mut regressions,
+        );
+        Self::check_metric(
+            "memory bytes",
+            baseline.memory_bytes,
+            memory_bytes,
+            tolerance_pct,
+            &mut regressions,
+        );
+        Ok(BaselineComparison {
+            ramp: ramp.to_string(),
+            function: function.to_string(),
+            baseline_best: baseline.best,
+            current_best: best,
+            baseline_instructions: baseline.instructions,
+            current_instructions: instructions,
+            baseline_memory_bytes: baseline.memory_bytes,
+            current_memory_bytes: memory_bytes,
+            tolerance_pct,
+            regressions,
+        })
+    }
+
+    /// Returns `true` if any metric regressed beyond tolerance.
+    pub fn has_regression(&self) -> bool {
+        !self.regressions.is_empty()
+    }
+
+    /// Human-readable regression descriptions, one per violated metric.
+    pub fn regressions(&self) -> &[String] {
+        &self.regressions
+    }
+
+    fn check_metric(name: &str, old: u64, new: u64, tolerance_pct: f64, out: &mut Vec<String>) {
+        if new <= old {
+            return;
+        }
+        let growth_pct = ((new - old) as f64 / old.max(1) as f64) * 100.0;
+        if growth_pct <= tolerance_pct {
+            return;
+        }
+        out.push(format!(
+            "{name} grew from {old} to {new} ({growth_pct:.1}%, over the {tolerance_pct:.1}% tolerance)"
+        ));
+    }
+}
+
+/// Which strategy to use during the initial scan phase of a `limits` run.
+///
+/// Pass via `--search-strategy`. The binary-refinement phase that narrows the
+/// bracket found by the scan always runs regardless of strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchStrategy {
+    /// Double the ramp value on each step: 1, 2, 4, 8, … (default). Finds a
+    /// failing bracket in O(log N) probes; best when the ceiling is unknown.
+    #[default]
+    Doubling,
+    /// Advance by a fixed step on each probe. The step size is set by
+    /// `--step` (default 1). Use when you need a fully predictable probe
+    /// sequence or want to explore a narrow range exhaustively.
+    FixedStep,
+}
+
+impl std::str::FromStr for SearchStrategy {
+    type Err = CliError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "doubling" => Ok(SearchStrategy::Doubling),
+            "fixed-step" => Ok(SearchStrategy::FixedStep),
+            other => Err(CliError(format!(
+                "unknown search strategy {other:?}; available strategies: doubling, fixed-step"
+            ))),
+        }
+    }
+}
+
 /// Arguments for `soroban-testkit limits`.
 #[derive(Args)]
 pub struct LimitsArgs {
@@ -291,23 +761,42 @@ pub struct LimitsArgs {
     /// running limits; this command does not rebuild contracts.
     #[arg(long, value_name = "PATH")]
     contract: std::path::PathBuf,
-    /// The contract function to ramp.
-    #[arg(long = "fn", value_name = "NAME")]
-    function: String,
+    /// The contract function to ramp. Required unless --preset is given.
+    #[arg(long = "fn", value_name = "NAME", required_unless_present = "preset")]
+    function: Option<String>,
     /// The parameter to increase on each attempt. Must exactly match an input
     /// name in the selected function's contract ABI; checked before probing.
-    #[arg(long, value_name = "PARAM")]
-    ramp: String,
+    /// Required unless --preset is given.
+    #[arg(long, value_name = "PARAM", required_unless_present = "preset")]
+    ramp: Option<String>,
+    /// Additional parameters to ramp in lockstep with --ramp. Each listed
+    /// parameter is set to the same value as the primary ramp parameter on
+    /// every probe. Repeatable. Must each match an input name in the ABI.
+    #[arg(long = "co-ramp", value_name = "PARAM")]
+    co_ramp: Vec<String>,
     /// Explicit value for a non-ramped parameter, as NAME=VALUE. Repeatable.
     /// Scalars use their Soroban type; Bytes uses 0x-prefixed hexadecimal.
     #[arg(long = "arg", value_name = "NAME=VALUE")]
     arg_values: Vec<String>,
-    /// Kill and treat as a failure any single probe that runs longer than
-    /// this many seconds. Guards against a ramp value that hangs the host
-    /// (rather than erroring or aborting) turning `limits` into an
-    /// infinite wait.
+    /// Kill and treat as a failure any single isolated probe that runs longer
+    /// than this many seconds. Guards against a ramp value that hangs the
+    /// host (rather than erroring or aborting) turning `limits` into an
+    /// infinite wait. A killed probe is classified `timed-out`, and its report
+    /// names the ramp value and the timeout that was exceeded.
     #[arg(long, value_name = "SECONDS", default_value_t = 30)]
     probe_timeout: u64,
+    /// Fail the whole command if probing takes longer than this many seconds
+    /// in total (at least 1; off by default). Each probe waits at most for the
+    /// time left, so the run stops close to the deadline even with a large
+    /// --probe-timeout. A probe cut short by this deadline is not counted as a
+    /// resource ceiling; the error reports the best value verified so far.
+    #[arg(long, value_name = "SECONDS")]
+    timeout: Option<u64>,
+    /// Print one progress line per probe to stderr while ramping: the phase
+    /// (scan or refine), probe count, ramp value, outcome, elapsed time and the
+    /// best value so far. Stdout and the --export JSON are unchanged.
+    #[arg(long, default_value_t = false)]
+    progress: bool,
     /// Probe up to this many ramp values at once while doubling to find the
     /// first failing value (1 to 8, default 1 = sequential). Results are read
     /// back in ramp order, so the reported boundary does not depend on which
@@ -338,6 +827,58 @@ pub struct LimitsArgs {
     /// Contains the discovered ceiling, instructions, and memory usage.
     #[arg(long, value_name = "PATH")]
     export: Option<std::path::PathBuf>,
+    /// Apply a named preset for a common batch workload, supplying defaults for
+    /// --fn and --ramp. Explicit --fn/--ramp/--arg flags always override the
+    /// preset's defaults. Available presets: batch-payout, token-transfer, multi-mint.
+    #[arg(long, value_name = "PRESET")]
+    preset: Option<String>,
+    /// Compare this run's result against a checked-in resource budget file.
+    /// The budget file specifies max_instructions, max_memory_bytes, and/or
+    /// min_best as key=value lines (with optional # comments). Exits non-zero
+    /// if any limit is exceeded.
+    #[arg(long, value_name = "PATH")]
+    budget: Option<std::path::PathBuf>,
+    /// Export every individual probe sample to PATH as a JSON array. Each
+    /// entry records the ramp value, whether it succeeded, and the failure
+    /// category when it failed. Useful for plotting the full resource curve.
+    #[arg(long, value_name = "PATH")]
+    export_samples: Option<std::path::PathBuf>,
+    /// Print the planned probe sequence without executing any probes and
+    /// exit. Shows the ramp values that would be attempted in the doubling
+    /// phase, up to the first theoretical failure bracket.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    /// Abort with an error if the total number of probe invocations exceeds
+    /// this limit. Protects against unexpectedly large search spaces in CI.
+    /// Set to 0 to disable the limit (the default).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max_probes: usize,
+    /// Override the directory where Cargo places the compiled .wasm artifact.
+    /// Useful when the contract was built with a custom `--target-dir` or when
+    /// running limits against a pre-built artifact in a non-standard location.
+    #[arg(long, value_name = "PATH")]
+    wasm_target_dir: Option<std::path::PathBuf>,
+    /// Cargo profile used when building the contract (e.g. `release`, `dev`).
+    /// Recorded in the output so results files carry the build context they
+    /// were produced with. Does not trigger a rebuild; the .wasm at `--contract`
+    /// is used as-is.
+    #[arg(long, value_name = "PROFILE")]
+    profile: Option<String>,
+    /// Strategy used during the initial scan phase that brackets the first
+    /// failing ramp value. `doubling` (the default) doubles on each probe:
+    /// 1, 2, 4, 8, … `fixed-step` advances by a fixed amount set with `--step`.
+    #[arg(long, value_name = "STRATEGY", default_value = "doubling")]
+    search_strategy: SearchStrategy,
+    /// Step size for `--search-strategy fixed-step`. The probe sequence will be
+    /// `--step`, `2 × --step`, `3 × --step`, … up to the search upper bound.
+    /// Ignored unless `--search-strategy fixed-step` is also set.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    step: u32,
+    /// Record the wall-clock duration of every probe in the samples output.
+    /// When set, each `ProbeSample` in `--export-samples` gains a `duration_ms`
+    /// field with the elapsed milliseconds from spawn to result classification.
+    #[arg(long, default_value_t = false)]
+    record_probe_duration: bool,
 }
 
 /// Hidden: runs exactly one probe (a single ramp value) and reports its
@@ -355,10 +896,16 @@ pub struct ProbeArgs {
     value: u32,
     #[arg(long = "arg", value_name = "NAME=VALUE")]
     arg_values: Vec<String>,
+    #[arg(long = "co-ramp")]
+    co_ramp: Vec<String>,
+    #[arg(long)]
+    wasm_target_dir: Option<std::path::PathBuf>,
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 /// Empirically discovers a resource ceiling by invoking `--fn` with an
-/// increasing `--ramp` parameter — natively, with no network access —
+/// increasing `--ramp` parameter â natively, with no network access â
 /// until it fails, then reports the last successful value plus the CPU
 /// instructions and memory consumed at that point.
 ///
@@ -369,7 +916,7 @@ pub struct ProbeArgs {
 /// *during actual WASM execution* (as opposed to a native, non-WASM
 /// `#[contract]` registration), the host can abort the whole process
 /// (`thread caused non-unwinding panic. aborting.`) rather than return an
-/// error or unwind — neither `catch_unwind` nor `try_invoke_contract`
+/// error or unwind â neither `catch_unwind` nor `try_invoke_contract`
 /// (the SDK's own no-panic call path) prevents this for the WASM target.
 /// A probe is therefore never invoked in-process. The full lifecycle is:
 ///
@@ -388,15 +935,21 @@ pub struct ProbeArgs {
 /// 3. **Bound the probe.** The parent waits up to `--probe-timeout` in
 ///    [`wait_with_timeout`]. If the child finishes, its exit status decides
 ///    the outcome; if it overruns, the parent kills it and records a
-///    [`ProbeFailureCategory::TimedOut`]. A child terminated by a signal
-///    (the host abort above) is recorded as [`ProbeFailureCategory::Abort`].
+///    [`ProbeFailureCategory::TimedOut`] whose stderr names the ramp value
+///    and the timeout. A child terminated by a signal (the host abort above)
+///    is recorded as [`ProbeFailureCategory::Abort`]. With `--timeout`, each
+///    wait is also clamped to the time left before the overall deadline; a
+///    probe cut short by that deadline fails the run with the best value
+///    verified so far instead of being recorded as a ceiling.
 /// 4. **Classify and search.** Every outcome is classified with
 ///    [`ProbeFailureCategory`]; the parent doubles to bracket the first
 ///    failure and then binary-searches with
 ///    [`refine_upper_bound_audited`], recording each probe's category.
 /// 5. **Report once.** The collected results are assembled into a single
 ///    [`LimitsSummary`] that renders both the terminal output and the JSON
-///    export, so the two can never disagree.
+///    export, so the two can never disagree. It includes the last failing
+///    probe ([`FailedProbe`]) next to the maximum success. With `--progress`,
+///    one line per probe is also written to stderr as results come in.
 ///
 /// If the parent cannot spawn a child at all, that is surfaced as a
 /// [`ProbeFailureCategory::SpawnFailure`] with guidance to reinstall the
@@ -407,7 +960,7 @@ pub struct ProbeArgs {
 /// The ramp parameter must be a numeric type (`u32`/`i32`/`u64`/`i64`/
 /// `u128`/`i128`, ramped as the value itself) or `Vec<T>` for a supported
 /// element type `T` (ramped as the element *count*, each element filled
-/// with a fixed value — see [`vec_element_val`]) — this covers the common
+/// with a fixed value â see [`vec_element_val`]) â this covers the common
 /// "maximum recipients in a batch operation" question directly, for
 /// `Vec<Address>` and beyond. Every other parameter is filled with a fixed
 /// default (an address, `0`, an empty collection, ...). A parameter type
@@ -419,11 +972,12 @@ pub struct ProbeArgs {
 /// they come from a transaction's simulated resource footprint, which
 /// this command's native invocation does not produce (that requires the
 /// network-dependent `stellar contract invoke` simulation path, which
-/// this crate deliberately avoids — see its "zero network access"
+/// this crate deliberately avoids â see its "zero network access"
 /// constraint). Only CPU instructions and memory, available locally via
 /// the host's budget, are reported.
 pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     validate_percentage("--baseline-tolerance-pct", args.baseline_tolerance_pct)?;
+    validate_timeouts(args.probe_timeout, args.timeout)?;
     if args.jobs == 0 || args.jobs > MAX_PROBE_JOBS {
         return Err(CliError(format!(
             "--jobs must be between 1 and {MAX_PROBE_JOBS} (got {})",
@@ -433,37 +987,116 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     // Validate the configuration (function exists, ramp parameter exists,
     // every parameter's type is one this command knows how to default or
-    // ramp) up front, in-process, before spawning any probes — this is
+    // ramp) up front, in-process, before spawning any probes â this is
     // just type/spec checking, not invocation, so it carries none of the
     // abort risk documented above, and it means a typo'd --fn or --ramp
     // reports its actual cause instead of the generic "failed at value 1"
     // a swallowed child-process error would otherwise produce.
-    let (_, env, function, ramp_index) = load(&args.contract, &args.function, &args.ramp)?;
-    build_args(&env, &function, ramp_index, 1, &args.arg_values)?;
+    let (function, ramp, effective_arg_values) = resolve_preset_defaults(&args)?;
+    let (_, env, function_spec, ramp_index) = load(&args.contract, &function, &ramp)?;
+    let co_ramp_indices: Vec<usize> = args
+        .co_ramp
+        .iter()
+        .map(|name| {
+            function_spec
+                .inputs
+                .iter()
+                .position(|input| input.name.to_utf8_string_lossy() == name.as_str())
+                .ok_or_else(|| {
+                    CliError(format!(
+                        "--co-ramp parameter {:?} not found in function {:?}",
+                        name, function
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    build_args(
+        &env,
+        &function_spec,
+        ramp_index,
+        &co_ramp_indices,
+        1,
+        &effective_arg_values,
+    )?;
     drop(env);
+
+    if args.dry_run {
+        println!("dry-run: would probe {:?} ramping {:?}", function, ramp);
+        match args.search_strategy {
+            SearchStrategy::Doubling => println!(
+                "  phase 1: doubling ladder 1, 2, 4, 8, \u{2026} up to {SEARCH_UPPER_BOUND}"
+            ),
+            SearchStrategy::FixedStep => println!(
+                "  phase 1: fixed-step ladder {step}, {two_step}, {three_step}, \u{2026} up to {SEARCH_UPPER_BOUND}",
+                step = args.step,
+                two_step = args.step.saturating_mul(2),
+                three_step = args.step.saturating_mul(3),
+            ),
+        }
+        println!("  phase 2: binary search to refine bounds");
+        if !args.co_ramp.is_empty() {
+            println!("  co-ramp parameters: {}", args.co_ramp.join(", "));
+        }
+        if args.max_probes > 0 {
+            println!("  max probes: {}", args.max_probes);
+        }
+        return Ok(());
+    }
 
     let self_exe = std::env::current_exe()
         .map_err(|err| CliError(format!("failed to locate this binary: {err}")))?;
 
     let probe_timeout = Duration::from_secs(args.probe_timeout);
+    let clock = RunClock::start(args.timeout.map(Duration::from_secs));
+    let progress = ProgressReporter::new(args.progress, &ramp, clock.started);
+    let mut last_failed: Option<FailedProbe> = None;
     let mut probe_failure_counts: BTreeMap<ProbeFailureCategory, usize> = BTreeMap::new();
     let mut last_failed_probe: Option<u32> = None;
     let mut last_failure_category: Option<ProbeFailureCategory> = None;
     let mut first_failed_probe_stderr: Option<String> = None;
     let mut hit_upper_bound = false;
+    let mut probe_count: usize = 0;
+    let mut all_samples: Vec<ProbeSample> = Vec::new();
 
     // Folds one probe result into the run's statistics. Only called in ramp
     // order, so the counts and the first failure's stderr match a sequential run.
-    let mut record = |value: u32, outcome: ProbeOutcome, stderr: String| {
+    // Highest success so far, shared with the deadline checks below.
+    let best_so_far: std::cell::Cell<Option<u32>> = std::cell::Cell::new(None);
+    let mut record = |phase: ProbePhase,
+                      value: u32,
+                      outcome: ProbeOutcome,
+                      stderr: String,
+                      duration_ms: Option<u64>| {
+        let (succeeded, failure_category) = match &outcome {
+            ProbeOutcome::Succeeded => (true, None),
+            ProbeOutcome::Failed(cat) => (false, Some(*cat)),
+        };
+        all_samples.push(ProbeSample {
+            value,
+            succeeded,
+            failure_category,
+            duration_ms,
+        });
+        if succeeded {
+            best_so_far.set(Some(
+                best_so_far.get().map_or(value, |best| best.max(value)),
+            ));
+        }
+        progress.report(all_samples.len(), phase, value, outcome, best_so_far.get());
         if let ProbeOutcome::Failed(category) = outcome {
+            last_failed = Some(FailedProbe {
+                value,
+                category,
+                stderr: Some(stderr.trim().to_string()).filter(|s| !s.is_empty()),
+            });
             // A contract failure cannot establish a budget ceiling, even if
             // earlier, lower ramp values succeeded.
             if category == ProbeFailureCategory::ContractFailure {
                 return Err(CliError(format!(
                     "contract function {:?} failed at {}={} before a resource limit was verified; \
                      check the contract's validation and trap logic; probe stderr: {}",
-                    args.function,
-                    args.ramp,
+                    function,
+                    ramp,
                     value,
                     stderr.trim()
                 )));
@@ -476,22 +1109,62 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         Ok(outcome)
     };
 
-    // Find a failing upper bound by doubling. Each batch holds up to `jobs`
-    // consecutive ladder values probed concurrently; results are read back in
-    // ladder order and reading stops at the first failure, so the outcome is
-    // the same as a sequential run.
+    // Validate fixed-step configuration before entering the scan loop.
+    if args.search_strategy == SearchStrategy::FixedStep && args.step == 0 {
+        return Err(CliError(
+            "--step must be at least 1 when using --search-strategy fixed-step".to_string(),
+        ));
+    }
+
+    // Find a failing upper bound. The strategy controls how the scan advances:
+    // - Doubling: 1, 2, 4, 8, … (O(log N) probes; best for unknown ceilings)
+    // - FixedStep: step, 2*step, 3*step, … (predictable sequence; uses --step)
+    // Each batch holds up to `jobs` consecutive values probed concurrently;
+    // results are read back in order and stop at the first failure.
     let mut last_ok: Option<u32> = None;
     let mut high = None;
-    let mut next = Some(1u32);
+    let mut next = Some(match args.search_strategy {
+        SearchStrategy::Doubling => 1u32,
+        SearchStrategy::FixedStep => args.step,
+    });
     while let Some(start) = next {
-        let batch = ladder_batch(start, SEARCH_UPPER_BOUND, args.jobs);
-        let results = probe_batch(&self_exe, &args, &batch, probe_timeout);
+        if args.max_probes > 0 && probe_count >= args.max_probes {
+            break;
+        }
+        clock.check(probe_count, best_so_far.get(), &function, &ramp)?;
+        let batch = match args.search_strategy {
+            SearchStrategy::Doubling => ladder_batch(start, SEARCH_UPPER_BOUND, args.jobs),
+            SearchStrategy::FixedStep => {
+                fixed_step_batch(start, SEARCH_UPPER_BOUND, args.step, args.jobs)
+            }
+        };
+        let wait = clock.probe_wait(probe_timeout);
+        let results = probe_batch(&self_exe, &args, &batch, wait);
         for (value, result) in batch.into_iter().zip(results) {
-            let (outcome, stderr) = result?;
-            match record(value, outcome, stderr)? {
+            probe_count += 1;
+            if args.max_probes > 0 && probe_count > args.max_probes {
+                break;
+            }
+            let (outcome, stderr, duration_ms) = result?;
+            clock.check_cut_short(
+                outcome,
+                wait,
+                probe_timeout,
+                value,
+                probe_count,
+                best_so_far.get(),
+                &function,
+                &ramp,
+            )?;
+            match record(ProbePhase::Scan, value, outcome, stderr, duration_ms)? {
                 ProbeOutcome::Succeeded => {
                     last_ok = Some(value);
-                    next = next_ramp_value(value, SEARCH_UPPER_BOUND);
+                    next = match args.search_strategy {
+                        SearchStrategy::Doubling => next_ramp_value(value, SEARCH_UPPER_BOUND),
+                        SearchStrategy::FixedStep => {
+                            next_fixed_step_value(value, SEARCH_UPPER_BOUND, args.step)
+                        }
+                    };
                     if next.is_none() {
                         hit_upper_bound = true;
                     }
@@ -525,8 +1198,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             "{:?} failed even at the smallest ramp value (1) for parameter {:?}{category_note}\
              {stderr_note}; \
              this usually indicates a validation error in the contract rather than a \
-             resource limit — check the contract's parameter validation logic and retry",
-            args.function, args.ramp
+             resource limit â check the contract's parameter validation logic and retry",
+            function, ramp
         )));
     };
 
@@ -540,8 +1213,24 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     if let Some(hi_start) = high {
         // Refinement is sequential: each midpoint depends on the previous result.
         let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
-            let (outcome, stderr) = spawn_probe(&self_exe, &args, value, probe_timeout)?;
-            record(value, outcome, stderr)
+            if args.max_probes > 0 && probe_count >= args.max_probes {
+                return Ok(ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure));
+            }
+            clock.check(probe_count, best_so_far.get(), &function, &ramp)?;
+            probe_count += 1;
+            let wait = clock.probe_wait(probe_timeout);
+            let (outcome, stderr, duration_ms) = spawn_probe(&self_exe, &args, value, wait)?;
+            clock.check_cut_short(
+                outcome,
+                wait,
+                probe_timeout,
+                value,
+                probe_count,
+                best_so_far.get(),
+                &function,
+                &ramp,
+            )?;
+            record(ProbePhase::Refine, value, outcome, stderr, duration_ms)
         };
         let (last_success, first_failure, audit) =
             refine_upper_bound_audited(last_ok, hi_start, &mut probe)?;
@@ -562,40 +1251,65 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     // Measure resources at the best-known-good value, in-process this
     // time (a known-successful call is safe to make directly).
-    let (instructions, memory_bytes) = measure(&args, best)?;
+    let (instructions, memory_bytes) = measure_at(
+        &args.contract,
+        &function,
+        &ramp,
+        &effective_arg_values,
+        best,
+    )?;
+
+    // Determine which resource boundary stopped the ramp.
+    let stopped_by = if hit_upper_bound {
+        Some(ResourceBoundary::Other)
+    } else if first_failure_category == Some(ProbeFailureCategory::ContractFailure) {
+        Some(ResourceBoundary::Other)
+    } else {
+        Some(infer_resource_boundary(instructions, memory_bytes))
+    };
 
     let reproduction = Some(build_reproduction_guidance(
         &sanitize_report_path(&args.contract),
-        &args.function,
-        &args.ramp,
+        &function,
+        &ramp,
         best,
-        &args.arg_values,
+        &effective_arg_values,
     ));
 
     let summary = LimitsSummary {
         contract: sanitize_report_path(&args.contract),
-        function: args.function.clone(),
-        ramp: args.ramp.clone(),
+        function: Some(function.clone()),
+        ramp: Some(ramp.clone()),
         best,
         instructions,
         memory_bytes,
         first_failed,
         first_failure_category,
         first_failed_probe_stderr,
+        last_failed_probe: last_failed,
         probe_failure_counts,
         hit_upper_bound,
         probe_timeout_secs: args.probe_timeout,
         audit: refinement_audit,
         measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
         reproduction,
+        stopped_by,
+        probe_samples: all_samples,
+        co_ramp: args.co_ramp.clone(),
+        compiler_meta: Some(collect_compiler_meta()),
+        wasm_target_dir: args
+            .wasm_target_dir
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        profile: args.profile.clone(),
     };
     print!("{}", summary.render_text());
 
     if let Some(baseline_path) = &args.baseline {
         compare_to_baseline(
             baseline_path,
-            &args.ramp,
-            &args.function,
+            &ramp,
+            &function,
             best,
             instructions,
             memory_bytes,
@@ -606,8 +1320,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         write_baseline(
             save_path,
             &args.contract,
-            &args.ramp,
-            &args.function,
+            &ramp,
+            &function,
             best,
             instructions,
             memory_bytes,
@@ -618,26 +1332,35 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         export_results(export_path, &summary)?;
         println!("exported results to {}", export_path.display());
     }
+    if let Some(budget_path) = &args.budget {
+        compare_to_budget(budget_path, &ramp, best, instructions, memory_bytes)?;
+    }
+    if let Some(samples_path) = &args.export_samples {
+        export_probe_samples(samples_path, &summary.probe_samples)?;
+        println!("exported probe samples to {}", samples_path.display());
+    }
 
     Ok(())
 }
 
 /// Runs one probe in its own process and returns its classified outcome with
-/// the captured stderr. It touches no shared state, so calls may run concurrently.
+/// the captured stderr and optional wall-clock duration. It touches no shared
+/// state, so calls may run concurrently.
 fn spawn_probe(
     self_exe: &Path,
     args: &LimitsArgs,
     value: u32,
     probe_timeout: Duration,
-) -> Result<(ProbeOutcome, String), CliError> {
+) -> Result<(ProbeOutcome, String, Option<u64>), CliError> {
+    let probe_start = args.record_probe_duration.then(Instant::now);
     let child = Command::new(self_exe)
         .arg("__limits-probe")
         .arg("--contract")
         .arg(&args.contract)
         .arg("--fn")
-        .arg(&args.function)
+        .arg(args.function.as_deref().unwrap_or(""))
         .arg("--ramp")
-        .arg(&args.ramp)
+        .arg(args.ramp.as_deref().unwrap_or(""))
         .arg("--value")
         .arg(value.to_string())
         .args(
@@ -645,6 +1368,17 @@ fn spawn_probe(
                 .iter()
                 .flat_map(|value| ["--arg", value.as_str()]),
         )
+        .args(
+            args.co_ramp
+                .iter()
+                .flat_map(|name| ["--co-ramp", name.as_str()]),
+        )
+        .args(
+            args.wasm_target_dir
+                .iter()
+                .flat_map(|dir| ["--wasm-target-dir", dir.to_str().unwrap_or("")]),
+        )
+        .args(args.profile.iter().flat_map(|p| ["--profile", p.as_str()]))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -679,7 +1413,20 @@ fn spawn_probe(
         Some(_) => ProbeOutcome::Failed(classify_probe_exit_stderr(&stderr)),
         None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
     };
-    Ok((outcome, stderr))
+    // A killed probe usually prints nothing, which would leave every report
+    // with no explanation. Record which value hit which deadline.
+    let stderr = if status.is_none() {
+        let note = timed_out_note(args.ramp.as_deref().unwrap_or(""), value, probe_timeout);
+        if stderr.trim().is_empty() {
+            note
+        } else {
+            format!("{note}; partial stderr: {}", stderr.trim())
+        }
+    } else {
+        stderr
+    };
+    let duration_ms = probe_start.map(|t| t.elapsed().as_millis() as u64);
+    Ok((outcome, stderr, duration_ms))
 }
 
 /// Runs `values` as concurrent probes, one thread each, and returns the results
@@ -689,7 +1436,7 @@ fn probe_batch(
     args: &LimitsArgs,
     values: &[u32],
     probe_timeout: Duration,
-) -> Vec<Result<(ProbeOutcome, String), CliError>> {
+) -> Vec<Result<(ProbeOutcome, String, Option<u64>), CliError>> {
     std::thread::scope(|scope| {
         let workers: Vec<_> = values
             .iter()
@@ -763,6 +1510,239 @@ pub fn build_reproduction_guidance(
     )
 }
 
+/// Context recorded for a probe the parent killed at its deadline.
+fn timed_out_note(ramp: &str, value: u32, timeout: Duration) -> String {
+    format!(
+        "probe for {ramp}={value} was killed after exceeding its {} timeout; \
+         raise --probe-timeout if this value should finish",
+        format_duration(timeout)
+    )
+}
+
+/// `1.5s`, `30s`, `250ms`: short, unit-bearing durations for messages.
+fn format_duration(duration: Duration) -> String {
+    let ms = duration.as_millis();
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms.is_multiple_of(1_000) {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
+    }
+}
+
+/// Rejects timeout settings the run could never honour, before any probe is
+/// spawned, so a bad flag is reported as such rather than as a probe failure.
+fn validate_timeouts(probe_timeout_secs: u64, timeout_secs: Option<u64>) -> Result<(), CliError> {
+    let fits_clock = |secs: u64| {
+        Instant::now()
+            .checked_add(Duration::from_secs(secs))
+            .is_some()
+    };
+    if !fits_clock(probe_timeout_secs) {
+        return Err(CliError(format!(
+            "--probe-timeout {probe_timeout_secs} is too large for the host clock; \
+             use a realistic per-probe limit such as 30 or 300 seconds"
+        )));
+    }
+    if let Some(total) = timeout_secs {
+        if total == 0 {
+            return Err(CliError(
+                "--timeout must be at least 1 second; omit it to let the command run until the \
+                 search finishes"
+                    .to_string(),
+            ));
+        }
+        if !fits_clock(total) {
+            return Err(CliError(format!(
+                "--timeout {total} is too large for the host clock; omit it to run without an \
+                 overall deadline"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Which search phase a probe belongs to, for progress output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePhase {
+    /// Doubling / fixed-step scan that brackets the first failure.
+    Scan,
+    /// Binary refinement between the last success and the first failure.
+    Refine,
+}
+
+impl ProbePhase {
+    fn label(self) -> &'static str {
+        match self {
+            ProbePhase::Scan => "scan",
+            ProbePhase::Refine => "refine",
+        }
+    }
+}
+
+/// Formats one `--progress` line (issue #362).
+fn format_progress_line(
+    probe_number: usize,
+    phase: ProbePhase,
+    ramp: &str,
+    value: u32,
+    outcome: ProbeOutcome,
+    best_so_far: Option<u32>,
+    elapsed: Duration,
+) -> String {
+    let result = match outcome {
+        ProbeOutcome::Succeeded => "ok".to_string(),
+        ProbeOutcome::Failed(category) => format!("failed [{category}]"),
+    };
+    let best = best_so_far.map_or_else(|| "none yet".to_string(), |best| best.to_string());
+    format!(
+        "limits: probe {probe_number} ({phase}) {ramp}={value} {result}; best so far: {best}; \
+         elapsed {}",
+        format_duration(elapsed),
+        phase = phase.label(),
+    )
+}
+
+/// Writes `--progress` lines to stderr when enabled; a no-op otherwise.
+struct ProgressReporter<'a> {
+    enabled: bool,
+    ramp: &'a str,
+    started: Instant,
+}
+
+impl<'a> ProgressReporter<'a> {
+    fn new(enabled: bool, ramp: &'a str, started: Instant) -> Self {
+        ProgressReporter {
+            enabled,
+            ramp,
+            started,
+        }
+    }
+
+    fn report(
+        &self,
+        probe_number: usize,
+        phase: ProbePhase,
+        value: u32,
+        outcome: ProbeOutcome,
+        best_so_far: Option<u32>,
+    ) {
+        if self.enabled {
+            eprintln!(
+                "{}",
+                format_progress_line(
+                    probe_number,
+                    phase,
+                    self.ramp,
+                    value,
+                    outcome,
+                    best_so_far,
+                    self.started.elapsed(),
+                )
+            );
+        }
+    }
+}
+
+/// Tracks the optional overall `--timeout` deadline (issue #361).
+struct RunClock {
+    started: Instant,
+    limit: Option<Duration>,
+    deadline: Option<Instant>,
+}
+
+impl RunClock {
+    fn start(limit: Option<Duration>) -> Self {
+        let started = Instant::now();
+        // validate_timeouts already rejected limits that overflow the clock.
+        let deadline = limit.and_then(|limit| started.checked_add(limit));
+        RunClock {
+            started,
+            limit,
+            deadline,
+        }
+    }
+
+    /// Time left before the overall deadline; `None` when there is none.
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// How long the next probe may run: the per-probe timeout, clamped to the
+    /// time left before the overall deadline.
+    fn probe_wait(&self, probe_timeout: Duration) -> Duration {
+        match self.remaining() {
+            Some(remaining) => probe_timeout.min(remaining),
+            None => probe_timeout,
+        }
+    }
+
+    /// Errors once the overall deadline has passed.
+    fn check(
+        &self,
+        probes_run: usize,
+        best: Option<u32>,
+        function: &str,
+        ramp: &str,
+    ) -> Result<(), CliError> {
+        match self.remaining() {
+            Some(remaining) if remaining.is_zero() => {
+                Err(self.exceeded(probes_run, best, None, function, ramp))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A probe that timed out only because the overall deadline clamped its
+    /// wait says nothing about the contract, so it ends the run instead of
+    /// being recorded as a `timed-out` ceiling.
+    #[allow(clippy::too_many_arguments)]
+    fn check_cut_short(
+        &self,
+        outcome: ProbeOutcome,
+        wait: Duration,
+        probe_timeout: Duration,
+        value: u32,
+        probes_run: usize,
+        best: Option<u32>,
+        function: &str,
+        ramp: &str,
+    ) -> Result<(), CliError> {
+        let cut_short =
+            outcome == ProbeOutcome::Failed(ProbeFailureCategory::TimedOut) && wait < probe_timeout;
+        if cut_short {
+            Err(self.exceeded(probes_run, best, Some(value), function, ramp))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn exceeded(
+        &self,
+        probes_run: usize,
+        best: Option<u32>,
+        interrupted: Option<u32>,
+        function: &str,
+        ramp: &str,
+    ) -> CliError {
+        let limit = self.limit.map(format_duration).unwrap_or_default();
+        let best = match best {
+            Some(best) => format!("the highest {ramp} verified so far is {best}"),
+            None => format!("no {ramp} value had succeeded yet"),
+        };
+        let interrupted = interrupted
+            .map(|value| format!(" while probing {ramp}={value}"))
+            .unwrap_or_default();
+        CliError(format!(
+            "limits for {function:?} exceeded --timeout ({limit}) after {probes_run} probe(s)\
+             {interrupted}; {best}, but the boundary was not confirmed. Raise --timeout, lower \
+             --probe-timeout, or use --jobs to probe faster, then re-run"
+        ))
+    }
+}
+
 fn validate_percentage(name: &str, pct: f64) -> Result<(), CliError> {
     if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
         return Err(CliError(format!(
@@ -781,9 +1761,36 @@ fn next_ramp_value(current: u32, upper_bound: u32) -> Option<u32> {
     }
 }
 
+/// Next value in a fixed-step sequence: `current + step`, clamped to `upper_bound`.
+/// Returns `None` when `current` has already reached the bound.
+fn next_fixed_step_value(current: u32, upper_bound: u32, step: u32) -> Option<u32> {
+    if current >= upper_bound {
+        None
+    } else {
+        Some(current.saturating_add(step).min(upper_bound))
+    }
+}
+
+/// A batch of up to `jobs` fixed-step values starting at `start`, each `step`
+/// apart, stopping at `upper_bound`.
+fn fixed_step_batch(start: u32, upper_bound: u32, step: u32, jobs: usize) -> Vec<u32> {
+    let jobs = jobs.max(1);
+    let step = step.max(1);
+    let mut batch = Vec::with_capacity(jobs);
+    let mut current = Some(start.min(upper_bound));
+    while let Some(value) = current {
+        if batch.len() == jobs {
+            break;
+        }
+        batch.push(value);
+        current = next_fixed_step_value(value, upper_bound, step);
+    }
+    batch
+}
+
 /// Refines the boundary between a known success (`low`) and a known failure (`high`)
 /// using binary search, recording every intermediate step in a [`RefinementAudit`]
-/// — including the standardized [`ProbeFailureCategory`] of each failing step.
+/// â including the standardized [`ProbeFailureCategory`] of each failing step.
 /// Re-probes both endpoints before refinement and rejects a contradictory bracket.
 /// The contract must succeed monotonically up to its ceiling: these checks detect
 /// observed inconsistencies, but cannot prove monotonicity at unprobed values.
@@ -877,7 +1884,7 @@ where
 
 /// The hidden child half of the isolation lifecycle documented on [`run`]:
 /// performs exactly one invocation in a throwaway [`Env`] registered from
-/// the `.wasm` and returns `Ok(())` (exit 0) or `Err` (exit 1) — no
+/// the `.wasm` and returns `Ok(())` (exit 0) or `Err` (exit 1) â no
 /// measurement, no output. Because the child dies after a single call, the
 /// parent can classify an abort by signal without losing its own run.
 ///
@@ -890,7 +1897,24 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
     let _quiet = QuietPanics::install();
     let (contract_id, env, function, ramp_index) =
         load(&args.contract, &args.function, &args.ramp)?;
-    let args_vec = build_args(&env, &function, ramp_index, args.value, &args.arg_values)?;
+    let co_ramp_indices: Vec<usize> = args
+        .co_ramp
+        .iter()
+        .filter_map(|name| {
+            function
+                .inputs
+                .iter()
+                .position(|input| input.name.to_utf8_string_lossy() == name.as_str())
+        })
+        .collect();
+    let args_vec = build_args(
+        &env,
+        &function,
+        ramp_index,
+        &co_ramp_indices,
+        args.value,
+        &args.arg_values,
+    )?;
     let func = Symbol::new(&env, &args.function);
     match env.try_invoke_contract::<Val, soroban_sdk::Error>(&contract_id, &func, args_vec) {
         Ok(Ok(_)) => Ok(()),
@@ -1247,8 +2271,8 @@ pub fn export_results(path: &Path, summary: &LimitsSummary) -> Result<(), CliErr
     } else {
         let baseline = Baseline {
             contract: Some(summary.contract.clone()),
-            function: summary.function.clone(),
-            ramp: summary.ramp.clone(),
+            function: summary.function.clone().unwrap_or_default(),
+            ramp: summary.ramp.clone().unwrap_or_default(),
             best: summary.best,
             instructions: summary.instructions,
             memory_bytes: summary.memory_bytes,
@@ -1263,22 +2287,156 @@ pub fn export_results(path: &Path, summary: &LimitsSummary) -> Result<(), CliErr
     }
 }
 
-fn measure(args: &LimitsArgs, value: u32) -> Result<(u64, u64), CliError> {
-    let (contract_id, env, function, ramp_index) =
-        load(&args.contract, &args.function, &args.ramp)?;
-    let func = Symbol::new(&env, &args.function);
+/// Writes all probe samples collected during the run to `path` as a JSON array.
+pub fn export_probe_samples(path: &Path, samples: &[ProbeSample]) -> Result<(), CliError> {
+    let json_str = serde_json::to_string_pretty(samples)
+        .map_err(|err| CliError(format!("failed to format probe samples JSON: {err}")))?;
+    std::fs::write(path, json_str).map_err(|err| {
+        CliError(format!(
+            "failed to write probe samples to {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn measure_at(
+    contract: &std::path::Path,
+    function: &str,
+    ramp: &str,
+    arg_values: &[String],
+    value: u32,
+) -> Result<(u64, u64), CliError> {
+    let (contract_id, env, fn_spec, ramp_index) = load(contract, function, ramp)?;
+    let func = Symbol::new(&env, function);
     let mut budget = env.cost_estimate().budget();
     budget.reset_default();
-    let args_vec = build_args(&env, &function, ramp_index, value, &args.arg_values)?;
+    let args_vec = build_args(&env, &fn_spec, ramp_index, &[], value, arg_values)?;
     if !invoke_succeeds(&env, &contract_id, &func, args_vec) {
         return Err(CliError(format!(
-            "internal error: {:?} reported ramp value {value} as successful during probing \
-             but failed on in-process re-measurement for parameter {:?}; re-run to confirm the \
-             boundary is stable, or lower --probe-timeout if the run is racing a hang",
-            args.function, args.ramp
+            "internal error: {:?} reported ramp value {value} as successful during probing              but failed on in-process re-measurement for parameter {:?}; re-run to confirm the              boundary is stable, or lower --probe-timeout if the run is racing a hang",
+            function, ramp
         )));
     }
     Ok((budget.cpu_instruction_cost(), budget.memory_bytes_cost()))
+}
+
+/// Infer which Soroban resource boundary was most likely the binding constraint.
+///
+/// Compares each metric as a fraction of its known mainnet limit. The resource
+/// with the higher fraction is returned; below a 25% threshold, [`ResourceBoundary::Other`]
+/// is returned because neither resource was notably consumed.
+fn infer_resource_boundary(instructions: u64, memory_bytes: u64) -> ResourceBoundary {
+    let insn_frac = instructions as f64 / SOROBAN_CPU_INSN_LIMIT as f64;
+    let mem_frac = memory_bytes as f64 / SOROBAN_MEMORY_LIMIT as f64;
+    const THRESHOLD: f64 = 0.25;
+    if insn_frac < THRESHOLD && mem_frac < THRESHOLD {
+        ResourceBoundary::Other
+    } else if insn_frac >= mem_frac {
+        ResourceBoundary::Instructions
+    } else {
+        ResourceBoundary::Memory
+    }
+}
+
+/// Resolve --fn, --ramp, and --arg values by applying any --preset defaults.
+///
+/// Explicit --fn/--ramp/--arg flags always win over preset defaults.
+/// Returns an error if --fn or --ramp are absent and no preset is given.
+fn resolve_preset_defaults(args: &LimitsArgs) -> Result<(String, String, Vec<String>), CliError> {
+    let (function, ramp, extra_args): (String, String, &[&str]) =
+        if let Some(preset_name) = &args.preset {
+            let preset = RampPreset::from_name(preset_name)?;
+            let function = args
+                .function
+                .clone()
+                .unwrap_or_else(|| preset.function().to_string());
+            let ramp = args
+                .ramp
+                .clone()
+                .unwrap_or_else(|| preset.ramp().to_string());
+            (function, ramp, preset.default_args())
+        } else {
+            let function = args
+                .function
+                .clone()
+                .ok_or_else(|| CliError("--fn is required unless --preset is given".to_string()))?;
+            let ramp = args.ramp.clone().ok_or_else(|| {
+                CliError("--ramp is required unless --preset is given".to_string())
+            })?;
+            (function, ramp, &[])
+        };
+
+    let mut effective_args = args.arg_values.clone();
+    for default_arg in extra_args {
+        let arg_name = default_arg.split('=').next().unwrap_or("");
+        if !effective_args
+            .iter()
+            .any(|a| a.starts_with(&format!("{arg_name}=")))
+        {
+            effective_args.push(default_arg.to_string());
+        }
+    }
+
+    Ok((function, ramp, effective_args))
+}
+
+/// Compare a run's results against a checked-in resource budget file.
+///
+/// Prints a before/after summary for each checked field and returns an error
+/// if any limit is exceeded, so CI fails actionably rather than silently.
+fn compare_to_budget(
+    path: &std::path::Path,
+    ramp: &str,
+    best: u32,
+    instructions: u64,
+    memory_bytes: u64,
+) -> Result<(), CliError> {
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        CliError(format!(
+            "failed to read resource budget at {}: {err}",
+            path.display()
+        ))
+    })?;
+    let budget = ResourceBudget::parse(&contents)?;
+
+    println!("resource budget check ({}):", path.display());
+
+    let mut violations = Vec::new();
+
+    if let Some(min_best) = budget.min_best {
+        println!("  {ramp} ceiling: {best} (budget minimum: {min_best})");
+        if best < min_best {
+            violations.push(format!(
+                "{ramp} ceiling {best} is below the budget minimum of {min_best}"
+            ));
+        }
+    }
+    if let Some(max_insn) = budget.max_instructions {
+        println!("  instructions: {instructions} (budget maximum: {max_insn})");
+        if instructions > max_insn {
+            violations.push(format!(
+                "instructions {instructions} exceed the budget maximum of {max_insn}"
+            ));
+        }
+    }
+    if let Some(max_mem) = budget.max_memory_bytes {
+        println!("  memory bytes: {memory_bytes} (budget maximum: {max_mem})");
+        if memory_bytes > max_mem {
+            violations.push(format!(
+                "memory bytes {memory_bytes} exceed the budget maximum of {max_mem}"
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        println!("  all checks passed");
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "resource budget exceeded: {}",
+            violations.join("; ")
+        )))
+    }
 }
 
 /// Silences the default panic hook for the duration it's held, restoring
@@ -1398,8 +2556,8 @@ fn load(
     let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
         capture_snapshot_at_drop: false,
     });
-    // Auth is not what this command measures — it exists to find a
-    // resource ceiling, not to prove who may call the function — and each
+    // Auth is not what this command measures â it exists to find a
+    // resource ceiling, not to prove who may call the function â and each
     // probe runs in its own throwaway process/Env, so blanket-approving
     // auth here carries none of the AuthMatrix-correctness risk that a
     // shared, longer-lived TestEnv would (see TestToken's mint, which
@@ -1414,6 +2572,7 @@ fn build_args(
     env: &Env,
     function: &ScSpecFunctionV0,
     ramp_index: usize,
+    co_ramp_indices: &[usize],
     ramp_value: u32,
     explicit: &[String],
 ) -> Result<SVec<Val>, CliError> {
@@ -1451,7 +2610,7 @@ fn build_args(
     }
     for (i, input) in function.inputs.iter().enumerate() {
         let input_name = input.name.to_utf8_string_lossy();
-        let val = if i == ramp_index {
+        let val = if i == ramp_index || co_ramp_indices.contains(&i) {
             ramp_val(env, &input.type_, ramp_value)?
         } else if let Some(value) = overrides.get(input_name.as_str()) {
             explicit_val(env, &input.type_, value)?
@@ -1539,7 +2698,7 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, CliError> {
 
 fn invoke_succeeds(env: &Env, contract_id: &Address, func: &Symbol, args: SVec<Val>) -> bool {
     // try_invoke_contract is the SDK's own no-panic call path, used here
-    // so a probe that succeeds doesn't need catch_unwind at all — only a
+    // so a probe that succeeds doesn't need catch_unwind at all â only a
     // *failing* real-WASM call risks the process abort documented above,
     // and that only ever happens in the isolated child process.
     matches!(
@@ -1551,6 +2710,12 @@ fn invoke_succeeds(env: &Env, contract_id: &Address, func: &Symbol, args: SVec<V
 fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, CliError> {
     match type_ {
         ScSpecTypeDef::U32 => Ok(ramp_value.into_val(env)),
+        // Signed integer types are supported: the internal ramp counter is a
+        // u32 (0..=SEARCH_UPPER_BOUND), cast to the target signed type. For
+        // values ≤ i32::MAX / i64::MAX / i128::MAX this is a lossless widening
+        // cast that produces the expected positive ramp sequence. Values above
+        // i32::MAX would wrap negative on cast to i32; in practice the ramp
+        // ceiling for a signed-integer parameter is found well below that bound.
         ScSpecTypeDef::I32 => Ok((ramp_value as i32).into_val(env)),
         ScSpecTypeDef::U64 => Ok((ramp_value as u64).into_val(env)),
         ScSpecTypeDef::I64 => Ok((ramp_value as i64).into_val(env)),
@@ -1561,7 +2726,7 @@ fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, Cl
             Ok(soroban_sdk::Bytes::from_slice(env, &bytes).into_val(env))
         }
         // Any Vec<T> is ramped as its element *count*, filled with a fixed
-        // per-element value from `vec_element_val` — the same "maximum
+        // per-element value from `vec_element_val` â the same "maximum
         // recipients" shape as the original Vec<Address>-only support, now
         // generalized to any element type this command already knows how
         // to default. The element value itself never varies across the
@@ -1616,7 +2781,7 @@ fn default_val(
 ) -> Result<Val, CliError> {
     match type_ {
         // A parameter literally named `token` is, by overwhelming Soroban
-        // convention, a token contract address — and a batch/payout-style
+        // convention, a token contract address â and a batch/payout-style
         // function will call transfer() on it and needs `admin` to hold a
         // real balance, not just a syntactically valid address. Deploying
         // a funded Stellar Asset Contract for this one case is a
@@ -1676,6 +2841,26 @@ mod tests {
     use super::*;
     use soroban_sdk::xdr::ScSpecTypeVec;
     use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    /// `LimitsArgs` derives `clap::Args` (it is flattened into the top-level
+    /// CLI), which has no `try_parse_from`. Parse through a one-field wrapper
+    /// so the flag tests exercise the real clap definitions.
+    #[derive(clap::Parser)]
+    struct LimitsCli {
+        #[command(flatten)]
+        args: LimitsArgs,
+    }
+
+    impl LimitsArgs {
+        fn try_parse_from<I, T>(argv: I) -> Result<Self, clap::Error>
+        where
+            I: IntoIterator<Item = T>,
+            T: Into<std::ffi::OsString> + Clone,
+        {
+            <LimitsCli as clap::Parser>::try_parse_from(argv).map(|cli| cli.args)
+        }
+    }
 
     // ---- #239: Vec<T> ramp support ----
 
@@ -1851,14 +3036,15 @@ mod tests {
     fn sample_summary() -> LimitsSummary {
         LimitsSummary {
             contract: "vault.wasm".to_string(),
-            function: "batch_payout".to_string(),
-            ramp: "recipients".to_string(),
+            function: Some("batch_payout".to_string()),
+            ramp: Some("recipients".to_string()),
             best: 100,
             instructions: 1_000_000,
             memory_bytes: 50_000,
             first_failed: Some(101),
             first_failure_category: Some(ProbeFailureCategory::ExitFailure),
             first_failed_probe_stderr: None,
+            last_failed_probe: None,
             probe_failure_counts: BTreeMap::from([(ProbeFailureCategory::ExitFailure, 1)]),
             hit_upper_bound: false,
             probe_timeout_secs: 30,
@@ -1867,6 +3053,12 @@ mod tests {
             reproduction: Some(
                 "invoke `batch_payout` with `recipients` = 100 in a test environment; to re-verify the boundary via CLI run: `soroban-testkit limits --contract vault.wasm --fn batch_payout --ramp recipients`".to_string(),
             ),
+            stopped_by: None,
+            probe_samples: Vec::new(),
+            co_ramp: Vec::new(),
+            compiler_meta: None,
+            wasm_target_dir: None,
+            profile: None,
         }
     }
 
@@ -2272,15 +3464,28 @@ mod tests {
     fn run_distinguishes_validation_failures_from_limits() {
         let err_result = LimitsArgs {
             contract: std::path::PathBuf::from("nonexistent.wasm"),
-            function: "test".to_string(),
-            ramp: "count".to_string(),
+            function: Some("test".to_string()),
+            ramp: Some("count".to_string()),
             probe_timeout: 30,
+            timeout: None,
+            progress: false,
             jobs: 1,
             baseline: None,
             baseline_tolerance_pct: 5.0,
             save_baseline: None,
             export: None,
+            preset: None,
+            budget: None,
             arg_values: Vec::new(),
+            co_ramp: Vec::new(),
+            dry_run: false,
+            export_samples: None,
+            max_probes: 0,
+            wasm_target_dir: None,
+            profile: None,
+            search_strategy: SearchStrategy::Doubling,
+            step: 1,
+            record_probe_duration: false,
         };
 
         let result = run(err_result);
@@ -2298,15 +3503,28 @@ mod tests {
     fn args_with_jobs(jobs: usize) -> LimitsArgs {
         LimitsArgs {
             contract: std::path::PathBuf::from("nonexistent.wasm"),
-            function: "test".to_string(),
-            ramp: "count".to_string(),
+            function: Some("test".to_string()),
+            ramp: Some("count".to_string()),
             probe_timeout: 30,
+            timeout: None,
+            progress: false,
             jobs,
             baseline: None,
             baseline_tolerance_pct: 5.0,
             save_baseline: None,
             export: None,
+            preset: None,
+            budget: None,
             arg_values: Vec::new(),
+            co_ramp: Vec::new(),
+            dry_run: false,
+            export_samples: None,
+            max_probes: 0,
+            wasm_target_dir: None,
+            profile: None,
+            search_strategy: SearchStrategy::Doubling,
+            step: 1,
+            record_probe_duration: false,
         }
     }
 
@@ -2772,7 +3990,7 @@ mod tests {
     #[test]
     fn explicit_val_empty_bytes_override_produces_valid_empty_bytes() {
         let env = Env::default();
-        // 0x with no hex digits — the regression input. Must produce the
+        // 0x with no hex digits â the regression input. Must produce the
         // same empty Bytes that `Bytes::new` does, not invalid XDR.
         let val = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x").unwrap();
         let bytes: soroban_sdk::Bytes = val.into_val(&env);
@@ -2933,5 +4151,1432 @@ mod tests {
         assert!(baseline_path.exists(), "baseline should be created");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    // ---- #378: explain which resource boundary stopped the ramp ----
+
+    #[test]
+    fn resource_boundary_identifies_instruction_bound() {
+        // 80M instructions out of 100M limit = 80%; 1MB out of 40MB = 2.5%
+        let boundary = infer_resource_boundary(80_000_000, 1_000_000);
+        assert_eq!(boundary, ResourceBoundary::Instructions);
+        assert!(!boundary.explanation().is_empty());
+    }
+
+    #[test]
+    fn resource_boundary_identifies_memory_bound() {
+        // 1M instructions out of 100M = 1%; 35MB out of 40MB = 87.5%
+        let boundary = infer_resource_boundary(1_000_000, 36_700_160);
+        assert_eq!(boundary, ResourceBoundary::Memory);
+    }
+
+    #[test]
+    fn resource_boundary_returns_other_when_both_low() {
+        // Both below 25% threshold
+        let boundary = infer_resource_boundary(1_000_000, 100_000);
+        assert_eq!(boundary, ResourceBoundary::Other);
+        assert!(boundary.explanation().contains("neither resource"));
+    }
+
+    #[test]
+    fn resource_boundary_display_matches_serde() {
+        assert_eq!(ResourceBoundary::Instructions.to_string(), "instructions");
+        assert_eq!(ResourceBoundary::Memory.to_string(), "memory");
+        assert_eq!(ResourceBoundary::Other.to_string(), "other");
+        let json = serde_json::to_value(ResourceBoundary::Instructions).unwrap();
+        assert_eq!(json, serde_json::json!("instructions"));
+        let parsed: ResourceBoundary = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, ResourceBoundary::Instructions);
+    }
+
+    #[test]
+    fn stopped_by_appears_in_render_text_when_set() {
+        let summary = LimitsSummary {
+            stopped_by: Some(ResourceBoundary::Instructions),
+            ..sample_summary()
+        };
+        let text = summary.render_text();
+        assert!(text.contains("resource boundary: instructions"), "{text}");
+        assert!(text.contains("compute-bound"), "{text}");
+    }
+
+    #[test]
+    fn stopped_by_appears_in_json_when_set() {
+        let summary = LimitsSummary {
+            stopped_by: Some(ResourceBoundary::Memory),
+            ..sample_summary()
+        };
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["stopped_by"], "memory");
+    }
+
+    #[test]
+    fn stopped_by_omitted_from_json_when_none() {
+        let summary = LimitsSummary {
+            stopped_by: None,
+            ..sample_summary()
+        };
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("stopped_by").is_none() || json["stopped_by"].is_null());
+    }
+
+    // ---- #379: document how to interpret local instruction measurements ----
+
+    #[test]
+    fn instruction_interpretation_constant_is_non_empty_and_informative() {
+        assert!(!INSTRUCTION_INTERPRETATION.is_empty());
+        assert!(
+            INSTRUCTION_INTERPRETATION.contains("100,000,000"),
+            "{INSTRUCTION_INTERPRETATION}"
+        );
+        assert!(
+            INSTRUCTION_INTERPRETATION.contains("mainnet"),
+            "{INSTRUCTION_INTERPRETATION}"
+        );
+        assert!(
+            INSTRUCTION_INTERPRETATION.contains("wall-clock"),
+            "{INSTRUCTION_INTERPRETATION}"
+        );
+    }
+
+    #[test]
+    fn render_text_includes_instruction_interpretation() {
+        let text = sample_summary().render_text();
+        assert!(
+            text.contains("instruction counts are Soroban host CPU instructions"),
+            "render_text must include instruction interpretation: {text}"
+        );
+        assert!(
+            text.contains("100,000,000"),
+            "render_text must include mainnet limit: {text}"
+        );
+    }
+
+    // ---- #377: named ramp presets ----
+
+    #[test]
+    fn ramp_preset_from_name_accepts_valid_presets() {
+        assert_eq!(
+            RampPreset::from_name("batch-payout").unwrap(),
+            RampPreset::BatchPayout
+        );
+        assert_eq!(
+            RampPreset::from_name("token-transfer").unwrap(),
+            RampPreset::TokenTransfer
+        );
+        assert_eq!(
+            RampPreset::from_name("multi-mint").unwrap(),
+            RampPreset::MultiMint
+        );
+    }
+
+    #[test]
+    fn ramp_preset_from_name_rejects_unknown_preset() {
+        let err = RampPreset::from_name("nonexistent-preset").unwrap_err();
+        assert!(err.0.contains("unknown preset"), "{}", err.0);
+        assert!(err.0.contains("batch-payout"), "{}", err.0);
+        assert!(err.0.contains("token-transfer"), "{}", err.0);
+        assert!(err.0.contains("multi-mint"), "{}", err.0);
+    }
+
+    #[test]
+    fn ramp_preset_function_and_ramp_match_documented_values() {
+        assert_eq!(RampPreset::BatchPayout.function(), "batch_payout");
+        assert_eq!(RampPreset::BatchPayout.ramp(), "recipients");
+        assert_eq!(RampPreset::TokenTransfer.function(), "transfer");
+        assert_eq!(RampPreset::TokenTransfer.ramp(), "amount");
+        assert_eq!(RampPreset::MultiMint.function(), "mint");
+        assert_eq!(RampPreset::MultiMint.ramp(), "count");
+    }
+
+    fn make_preset_args(
+        function: Option<&str>,
+        ramp: Option<&str>,
+        preset: Option<&str>,
+    ) -> LimitsArgs {
+        LimitsArgs {
+            contract: std::path::PathBuf::from("x.wasm"),
+            function: function.map(str::to_string),
+            ramp: ramp.map(str::to_string),
+            arg_values: vec![],
+            probe_timeout: 30,
+            timeout: None,
+            progress: false,
+            jobs: 1,
+            baseline: None,
+            baseline_tolerance_pct: 5.0,
+            save_baseline: None,
+            export: None,
+            preset: preset.map(str::to_string),
+            budget: None,
+            co_ramp: Vec::new(),
+            dry_run: false,
+            export_samples: None,
+            max_probes: 0,
+            wasm_target_dir: None,
+            profile: None,
+            search_strategy: SearchStrategy::Doubling,
+            step: 1,
+            record_probe_duration: false,
+        }
+    }
+
+    #[test]
+    fn resolve_preset_defaults_uses_explicit_fn_over_preset() {
+        let args = make_preset_args(Some("custom_fn"), None, Some("batch-payout"));
+        let (function, ramp, _) = resolve_preset_defaults(&args).unwrap();
+        assert_eq!(function, "custom_fn");
+        assert_eq!(ramp, "recipients"); // falls back to preset
+    }
+
+    #[test]
+    fn resolve_preset_defaults_uses_explicit_ramp_over_preset() {
+        let args = make_preset_args(None, Some("custom_ramp"), Some("batch-payout"));
+        let (function, ramp, _) = resolve_preset_defaults(&args).unwrap();
+        assert_eq!(function, "batch_payout"); // falls back to preset
+        assert_eq!(ramp, "custom_ramp");
+    }
+
+    #[test]
+    fn resolve_preset_defaults_errors_without_preset_and_missing_fn() {
+        let args = make_preset_args(None, Some("r"), None);
+        let err = resolve_preset_defaults(&args).unwrap_err();
+        assert!(err.0.contains("--fn is required"), "{}", err.0);
+    }
+
+    #[test]
+    fn resolve_preset_defaults_errors_without_preset_and_missing_ramp() {
+        let args = make_preset_args(Some("f"), None, None);
+        let err = resolve_preset_defaults(&args).unwrap_err();
+        assert!(err.0.contains("--ramp is required"), "{}", err.0);
+    }
+
+    // ---- #376: compare results against a checked-in resource budget ----
+
+    #[test]
+    fn resource_budget_parse_accepts_all_fields_with_comments() {
+        let contents = "# budget for batch_payout
+max_instructions=60000000
+max_memory_bytes=20000000
+min_best=50
+";
+        let budget = ResourceBudget::parse(contents).unwrap();
+        assert_eq!(budget.max_instructions, Some(60_000_000));
+        assert_eq!(budget.max_memory_bytes, Some(20_000_000));
+        assert_eq!(budget.min_best, Some(50));
+    }
+
+    #[test]
+    fn resource_budget_parse_accepts_partial_budget() {
+        let budget = ResourceBudget::parse(
+            "max_instructions=5000000
+",
+        )
+        .unwrap();
+        assert_eq!(budget.max_instructions, Some(5_000_000));
+        assert!(budget.max_memory_bytes.is_none());
+        assert!(budget.min_best.is_none());
+    }
+
+    #[test]
+    fn resource_budget_parse_accepts_empty_file() {
+        let budget = ResourceBudget::parse(
+            "# only a comment
+
+",
+        )
+        .unwrap();
+        assert!(budget.max_instructions.is_none());
+        assert!(budget.max_memory_bytes.is_none());
+        assert!(budget.min_best.is_none());
+    }
+
+    #[test]
+    fn resource_budget_parse_rejects_unknown_key() {
+        let err = ResourceBudget::parse(
+            "bogus_key=100
+",
+        )
+        .unwrap_err();
+        assert!(err.0.contains("unknown key"), "{}", err.0);
+        assert!(err.0.contains("bogus_key"), "{}", err.0);
+    }
+
+    #[test]
+    fn resource_budget_parse_rejects_malformed_line() {
+        let err = ResourceBudget::parse(
+            "not-key-value
+",
+        )
+        .unwrap_err();
+        assert!(err.0.contains("malformed budget file"), "{}", err.0);
+    }
+
+    #[test]
+    fn resource_budget_parse_rejects_non_numeric_value() {
+        let err = ResourceBudget::parse(
+            "max_instructions=abc
+",
+        )
+        .unwrap_err();
+        assert!(err.0.contains("malformed budget"), "{}", err.0);
+    }
+
+    #[test]
+    fn compare_to_budget_passes_when_within_all_limits() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-pass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pass.budget");
+        std::fs::write(
+            &path,
+            "max_instructions=2000000
+max_memory_bytes=500000
+min_best=50
+",
+        )
+        .unwrap();
+        let result = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn compare_to_budget_fails_when_instructions_exceeded() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-insn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("insn.budget");
+        std::fs::write(
+            &path,
+            "max_instructions=500000
+",
+        )
+        .unwrap();
+        let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
+        assert!(err.0.contains("instructions 1000000 exceed"), "{}", err.0);
+    }
+
+    #[test]
+    fn compare_to_budget_fails_when_memory_exceeded() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-mem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mem.budget");
+        std::fs::write(
+            &path,
+            "max_memory_bytes=100000
+",
+        )
+        .unwrap();
+        let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
+        assert!(err.0.contains("memory bytes 200000 exceed"), "{}", err.0);
+    }
+
+    #[test]
+    fn compare_to_budget_fails_when_ceiling_below_minimum() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-ceil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ceil.budget");
+        std::fs::write(
+            &path,
+            "min_best=200
+",
+        )
+        .unwrap();
+        let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
+        assert!(
+            err.0
+                .contains("recipients ceiling 100 is below the budget minimum of 200"),
+            "{}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn compare_to_budget_reports_missing_file_actionably() {
+        let missing = std::env::temp_dir().join("this-budget-does-not-exist.budget");
+        let err = compare_to_budget(&missing, "recipients", 100, 1_000_000, 200_000).unwrap_err();
+        assert!(
+            err.0.contains("failed to read resource budget"),
+            "{}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn compare_to_budget_reports_multiple_violations() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("multi.budget");
+        std::fs::write(
+            &path,
+            "max_instructions=100
+max_memory_bytes=100
+min_best=200
+",
+        )
+        .unwrap();
+        let err = compare_to_budget(&path, "recipients", 50, 1_000_000, 200_000).unwrap_err();
+        assert!(err.0.contains("resource budget exceeded"), "{}", err.0);
+        // All three violations should be listed
+        assert!(err.0.contains("instructions"), "{}", err.0);
+        assert!(err.0.contains("memory"), "{}", err.0);
+        assert!(err.0.contains("ceiling"), "{}", err.0);
+    }
+
+    // ── #372: dry-run mode ────────────────────────────────────────────────────
+
+    #[test]
+    fn dry_run_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--dry-run",
+        ])
+        .expect("--dry-run should be accepted");
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn dry_run_defaults_to_false() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
+        assert!(!args.dry_run);
+    }
+
+    // ── #373: export-samples ─────────────────────────────────────────────────
+
+    #[test]
+    fn export_samples_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--export-samples",
+            "/tmp/samples.json",
+        ])
+        .expect("--export-samples should be accepted");
+        assert!(args.export_samples.is_some());
+    }
+
+    #[test]
+    fn export_probe_samples_writes_json_array() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_probe_samples.json");
+        let samples = vec![
+            ProbeSample {
+                value: 1,
+                succeeded: true,
+                failure_category: None,
+                duration_ms: None,
+            },
+            ProbeSample {
+                value: 2,
+                succeeded: false,
+                failure_category: Some(ProbeFailureCategory::ExitFailure),
+                duration_ms: None,
+            },
+        ];
+        export_probe_samples(&path, &samples).expect("export should succeed");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("\"value\": 1"),
+            "missing value 1: {content}"
+        );
+        assert!(
+            content.contains("\"succeeded\": true"),
+            "missing succeeded true: {content}"
+        );
+        assert!(
+            content.contains("\"failure_category\": \"exit-failure\""),
+            "missing category: {content}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── #368: co-ramp ────────────────────────────────────────────────────────
+
+    #[test]
+    fn co_ramp_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--co-ramp",
+            "m",
+            "--co-ramp",
+            "k",
+        ])
+        .expect("--co-ramp should be accepted");
+        assert_eq!(args.co_ramp, vec!["m", "k"]);
+    }
+
+    #[test]
+    fn build_args_with_co_ramp_index_applies_ramp_value() {
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
+        env.mock_all_auths_allowing_non_root_auth();
+        let inputs = soroban_sdk::xdr::VecM::try_from(vec![
+            soroban_sdk::xdr::ScSpecFunctionInputV0 {
+                doc: soroban_sdk::xdr::StringM::default(),
+                name: soroban_sdk::xdr::StringM::try_from(b"a".to_vec()).unwrap(),
+                type_: soroban_sdk::xdr::ScSpecTypeDef::U32,
+            },
+            soroban_sdk::xdr::ScSpecFunctionInputV0 {
+                doc: soroban_sdk::xdr::StringM::default(),
+                name: soroban_sdk::xdr::StringM::try_from(b"b".to_vec()).unwrap(),
+                type_: soroban_sdk::xdr::ScSpecTypeDef::U32,
+            },
+        ])
+        .unwrap();
+        let function_spec = soroban_sdk::xdr::ScSpecFunctionV0 {
+            doc: soroban_sdk::xdr::StringM::default(),
+            name: soroban_sdk::xdr::ScSymbol(
+                soroban_sdk::xdr::StringM::try_from(b"f".to_vec()).unwrap(),
+            ),
+            inputs,
+            outputs: soroban_sdk::xdr::VecM::default(),
+        };
+        // ramp index 0, co-ramp index 1, value 42
+        let result = build_args(&env, &function_spec, 0, &[1], 42, &[]).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    // ── #369: max-probes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn max_probes_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--max-probes",
+            "10",
+        ])
+        .expect("--max-probes should be accepted");
+        assert_eq!(args.max_probes, 10);
+    }
+
+    #[test]
+    fn max_probes_defaults_to_zero() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
+        assert_eq!(args.max_probes, 0);
+    }
+
+    // ── #374: compiler and target metadata ───────────────────────────────────
+
+    #[test]
+    fn collect_compiler_meta_returns_non_empty_rustc_version() {
+        let meta = collect_compiler_meta();
+        assert!(
+            !meta.rustc_version.is_empty(),
+            "rustc_version should not be empty"
+        );
+        assert_eq!(meta.wasm_target, "wasm32v1-none");
+    }
+
+    #[test]
+    fn compiler_meta_serializes_with_kebab_case_keys() {
+        let meta = CompilerMeta {
+            rustc_version: "rustc 1.80.0 (051478957 2024-07-21)".to_string(),
+            wasm_target: "wasm32v1-none".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            json.contains("\"rustc-version\""),
+            "expected kebab-case key: {json}"
+        );
+        assert!(
+            json.contains("\"wasm-target\""),
+            "expected kebab-case key: {json}"
+        );
+    }
+
+    #[test]
+    fn limits_summary_compiler_meta_field_round_trips() {
+        let meta = CompilerMeta {
+            rustc_version: "rustc 1.80.0".to_string(),
+            wasm_target: "wasm32v1-none".to_string(),
+        };
+        let summary = LimitsSummary {
+            contract: "test.wasm".to_string(),
+            function: Some("f".to_string()),
+            ramp: Some("n".to_string()),
+            best: 10,
+            instructions: 1000,
+            memory_bytes: 2000,
+            first_failed: None,
+            first_failure_category: None,
+            first_failed_probe_stderr: None,
+            last_failed_probe: None,
+            probe_failure_counts: BTreeMap::new(),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: None,
+            stopped_by: None,
+            probe_samples: vec![],
+            co_ramp: vec![],
+            compiler_meta: Some(meta.clone()),
+            wasm_target_dir: None,
+            profile: None,
+        };
+        let json = serde_json::to_string_pretty(&summary).unwrap();
+        assert!(
+            json.contains("rustc-version"),
+            "compiler-meta missing from JSON: {json}"
+        );
+        let decoded: LimitsSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.compiler_meta, Some(meta));
+    }
+
+    #[test]
+    fn render_text_includes_compiler_meta() {
+        let summary = LimitsSummary {
+            contract: "test.wasm".to_string(),
+            function: Some("f".to_string()),
+            ramp: Some("n".to_string()),
+            best: 10,
+            instructions: 1000,
+            memory_bytes: 2000,
+            first_failed: None,
+            first_failure_category: None,
+            first_failed_probe_stderr: None,
+            last_failed_probe: None,
+            probe_failure_counts: BTreeMap::new(),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: None,
+            stopped_by: None,
+            probe_samples: vec![],
+            co_ramp: vec![],
+            compiler_meta: Some(CompilerMeta {
+                rustc_version: "rustc 1.80.0".to_string(),
+                wasm_target: "wasm32v1-none".to_string(),
+            }),
+            wasm_target_dir: None,
+            profile: None,
+        };
+        let text = summary.render_text();
+        assert!(
+            text.contains("rustc 1.80.0"),
+            "compiler version missing from text: {text}"
+        );
+        assert!(
+            text.contains("wasm32v1-none"),
+            "wasm target missing from text: {text}"
+        );
+    }
+
+    // ── #370: custom wasm target directory ───────────────────────────────────
+
+    #[test]
+    fn wasm_target_dir_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--wasm-target-dir",
+            "/custom/target",
+        ])
+        .expect("--wasm-target-dir should be accepted");
+        assert!(args.wasm_target_dir.is_some());
+        assert_eq!(
+            args.wasm_target_dir.unwrap().to_str().unwrap(),
+            "/custom/target"
+        );
+    }
+
+    #[test]
+    fn wasm_target_dir_defaults_to_none() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
+        assert!(args.wasm_target_dir.is_none());
+    }
+
+    #[test]
+    fn render_text_includes_wasm_target_dir_when_set() {
+        let summary = LimitsSummary {
+            contract: "test.wasm".to_string(),
+            function: Some("f".to_string()),
+            ramp: Some("n".to_string()),
+            best: 10,
+            instructions: 1000,
+            memory_bytes: 2000,
+            first_failed: None,
+            first_failure_category: None,
+            first_failed_probe_stderr: None,
+            last_failed_probe: None,
+            probe_failure_counts: BTreeMap::new(),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: None,
+            stopped_by: None,
+            probe_samples: vec![],
+            co_ramp: vec![],
+            compiler_meta: None,
+            wasm_target_dir: Some("/custom/target".to_string()),
+            profile: None,
+        };
+        let text = summary.render_text();
+        assert!(
+            text.contains("/custom/target"),
+            "wasm_target_dir missing from text: {text}"
+        );
+    }
+
+    // ── #371: cargo profile selection ────────────────────────────────────────
+
+    #[test]
+    fn profile_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--profile",
+            "dev",
+        ])
+        .expect("--profile should be accepted");
+        assert_eq!(args.profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn profile_defaults_to_none() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
+        assert!(args.profile.is_none());
+    }
+
+    #[test]
+    fn render_text_includes_profile_when_set() {
+        let summary = LimitsSummary {
+            contract: "test.wasm".to_string(),
+            function: Some("f".to_string()),
+            ramp: Some("n".to_string()),
+            best: 10,
+            instructions: 1000,
+            memory_bytes: 2000,
+            first_failed: None,
+            first_failure_category: None,
+            first_failed_probe_stderr: None,
+            last_failed_probe: None,
+            probe_failure_counts: BTreeMap::new(),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: None,
+            stopped_by: None,
+            probe_samples: vec![],
+            co_ramp: vec![],
+            compiler_meta: None,
+            wasm_target_dir: None,
+            profile: Some("dev".to_string()),
+        };
+        let text = summary.render_text();
+        assert!(text.contains("dev"), "profile missing from text: {text}");
+    }
+
+    // ── #375: reusable baseline comparison ───────────────────────────────────
+
+    #[test]
+    fn baseline_comparison_new_detects_no_regression() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 100, 50_000, 10_000, 5.0).unwrap();
+        assert!(!cmp.has_regression());
+        assert!(cmp.regressions().is_empty());
+    }
+
+    #[test]
+    fn baseline_comparison_detects_ceiling_regression() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 90, 50_000, 10_000, 5.0).unwrap();
+        assert!(cmp.has_regression());
+        assert_eq!(cmp.regressions().len(), 1);
+        assert!(
+            cmp.regressions()[0].contains("ceiling dropped"),
+            "{}",
+            cmp.regressions()[0]
+        );
+    }
+
+    #[test]
+    fn baseline_comparison_detects_instruction_regression_beyond_tolerance() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 100, 60_000, 10_000, 5.0).unwrap();
+        assert!(cmp.has_regression());
+        assert!(
+            cmp.regressions()[0].contains("instructions"),
+            "{}",
+            cmp.regressions()[0]
+        );
+    }
+
+    #[test]
+    fn baseline_comparison_allows_instruction_growth_within_tolerance() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 100, 52_000, 10_000, 5.0).unwrap();
+        assert!(!cmp.has_regression());
+    }
+
+    #[test]
+    fn baseline_comparison_errors_on_function_mismatch() {
+        let baseline = Baseline {
+            contract: None,
+            function: "other_fn".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let err =
+            BaselineComparison::new(&baseline, "n", "f", 100, 50_000, 10_000, 5.0).unwrap_err();
+        assert!(err.0.contains("other_fn"), "{}", err.0);
+    }
+
+    #[test]
+    fn baseline_comparison_carries_all_metrics() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 110, 55_000, 11_000, 10.0).unwrap();
+        assert_eq!(cmp.baseline_best, 100);
+        assert_eq!(cmp.current_best, 110);
+        assert_eq!(cmp.baseline_instructions, 50_000);
+        assert_eq!(cmp.current_instructions, 55_000);
+        assert_eq!(cmp.baseline_memory_bytes, 10_000);
+        assert_eq!(cmp.current_memory_bytes, 11_000);
+    }
+
+    // ---- #364: probe duration recording ----
+
+    #[test]
+    fn probe_sample_duration_ms_is_absent_by_default() {
+        let sample = ProbeSample {
+            value: 10,
+            succeeded: true,
+            failure_category: None,
+            duration_ms: None,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(
+            !json.contains("duration_ms"),
+            "duration_ms should be absent when None: {json}"
+        );
+    }
+
+    #[test]
+    fn probe_sample_duration_ms_is_present_when_set() {
+        let sample = ProbeSample {
+            value: 10,
+            succeeded: true,
+            failure_category: None,
+            duration_ms: Some(42),
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(
+            json.contains("\"duration_ms\":42"),
+            "duration_ms missing: {json}"
+        );
+    }
+
+    #[test]
+    fn probe_sample_duration_ms_round_trips_through_json() {
+        let sample = ProbeSample {
+            value: 7,
+            succeeded: false,
+            failure_category: Some(ProbeFailureCategory::TimedOut),
+            duration_ms: Some(1234),
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        let back: ProbeSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.duration_ms, Some(1234));
+        assert_eq!(back.failure_category, Some(ProbeFailureCategory::TimedOut));
+    }
+
+    // ---- #365: search strategy selection ----
+
+    #[test]
+    fn search_strategy_flag_accepts_doubling() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--search-strategy",
+            "doubling",
+        ])
+        .expect("--search-strategy doubling should be accepted");
+        assert_eq!(args.search_strategy, SearchStrategy::Doubling);
+    }
+
+    #[test]
+    fn search_strategy_flag_accepts_fixed_step() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--search-strategy",
+            "fixed-step",
+        ])
+        .expect("--search-strategy fixed-step should be accepted");
+        assert_eq!(args.search_strategy, SearchStrategy::FixedStep);
+    }
+
+    #[test]
+    fn search_strategy_defaults_to_doubling() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
+        assert_eq!(args.search_strategy, SearchStrategy::Doubling);
+    }
+
+    #[test]
+    fn search_strategy_rejects_unknown_value() {
+        let err = SearchStrategy::from_str("exponential").unwrap_err();
+        assert!(err.0.contains("unknown search strategy"), "{}", err.0);
+        assert!(err.0.contains("doubling"), "{}", err.0);
+        assert!(err.0.contains("fixed-step"), "{}", err.0);
+    }
+
+    // ---- #366: fixed-step ramp mode ----
+
+    #[test]
+    fn fixed_step_batch_produces_multiples_of_step() {
+        let batch = fixed_step_batch(10, 100, 10, 5);
+        assert_eq!(batch, vec![10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn fixed_step_batch_clamps_at_upper_bound() {
+        let batch = fixed_step_batch(90, 100, 10, 5);
+        assert_eq!(batch, vec![90, 100]);
+    }
+
+    #[test]
+    fn fixed_step_batch_stops_when_at_upper_bound() {
+        let batch = fixed_step_batch(100, 100, 10, 5);
+        assert_eq!(batch, vec![100]);
+    }
+
+    #[test]
+    fn next_fixed_step_value_advances_by_step() {
+        assert_eq!(next_fixed_step_value(10, 100, 10), Some(20));
+        assert_eq!(next_fixed_step_value(90, 100, 10), Some(100));
+        assert_eq!(next_fixed_step_value(100, 100, 10), None);
+    }
+
+    #[test]
+    fn step_flag_is_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--search-strategy",
+            "fixed-step",
+            "--step",
+            "50",
+        ])
+        .expect("--step should be accepted");
+        assert_eq!(args.step, 50);
+        assert_eq!(args.search_strategy, SearchStrategy::FixedStep);
+    }
+
+    // ---- #367: signed integer ramp parameter support ----
+
+    #[test]
+    fn ramp_val_i32_produces_expected_positive_sequence() {
+        let env = Env::default();
+        for v in [0u32, 1, 100, 1000, i32::MAX as u32] {
+            let val = ramp_val(&env, &ScSpecTypeDef::I32, v).unwrap();
+            let got: i32 = val.into_val(&env);
+            assert_eq!(got, v as i32, "i32 cast failed for {v}");
+        }
+    }
+
+    #[test]
+    fn ramp_val_i64_produces_expected_positive_sequence() {
+        let env = Env::default();
+        for v in [0u32, 1, 1_000_000, u32::MAX] {
+            let val = ramp_val(&env, &ScSpecTypeDef::I64, v).unwrap();
+            let got: i64 = val.into_val(&env);
+            assert_eq!(got, v as i64, "i64 cast failed for {v}");
+        }
+    }
+
+    #[test]
+    fn ramp_val_i128_produces_expected_positive_sequence() {
+        let env = Env::default();
+        for v in [0u32, 1, 1_000_000, u32::MAX] {
+            let val = ramp_val(&env, &ScSpecTypeDef::I128, v).unwrap();
+            let got: i128 = val.into_val(&env);
+            assert_eq!(got, v as i128, "i128 cast failed for {v}");
+        }
+    }
+
+    #[test]
+    fn record_probe_duration_flag_defaults_to_false() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
+        assert!(!args.record_probe_duration);
+    }
+
+    #[test]
+    fn record_probe_duration_flag_is_accepted() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--record-probe-duration",
+        ])
+        .expect("--record-probe-duration should be accepted");
+        assert!(args.record_probe_duration);
+    }
+
+    // ---- #360: per-probe timeout ----
+
+    #[test]
+    fn timed_out_note_names_the_ramp_value_and_the_timeout() {
+        let note = timed_out_note("recipients", 64, Duration::from_secs(30));
+        assert!(note.contains("recipients=64"), "{note}");
+        assert!(note.contains("30s timeout"), "{note}");
+        assert!(note.contains("raise --probe-timeout"), "{note}");
+    }
+
+    #[test]
+    fn format_duration_uses_the_shortest_readable_unit() {
+        assert_eq!(format_duration(Duration::ZERO), "0ms");
+        assert_eq!(format_duration(Duration::from_millis(250)), "250ms");
+        assert_eq!(format_duration(Duration::from_secs(30)), "30s");
+        assert_eq!(format_duration(Duration::from_millis(1_500)), "1.5s");
+    }
+
+    #[test]
+    fn probe_timeout_that_overflows_the_clock_is_rejected_before_probing() {
+        let err = validate_timeouts(u64::MAX, None).unwrap_err();
+        assert!(err.0.contains("--probe-timeout"), "{}", err.0);
+        assert!(err.0.contains("too large for the host clock"), "{}", err.0);
+    }
+
+    #[test]
+    fn realistic_probe_timeouts_are_accepted() {
+        // 0 is kept: it gives an immediate deadline, which tests rely on.
+        for secs in [0, 1, 30, 86_400] {
+            validate_timeouts(secs, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn probe_timeout_flag_parses_and_defaults_to_thirty_seconds() {
+        let base = ["limits", "--contract", "c.wasm", "--fn", "f", "--ramp", "n"];
+        assert_eq!(LimitsArgs::try_parse_from(base).unwrap().probe_timeout, 30);
+        let args = LimitsArgs::try_parse_from(base.iter().copied().chain(["--probe-timeout", "5"]))
+            .unwrap();
+        assert_eq!(args.probe_timeout, 5);
+        assert!(
+            LimitsArgs::try_parse_from(base.iter().copied().chain(["--probe-timeout", "-1"]))
+                .is_err()
+        );
+    }
+
+    // ---- #361: overall command timeout ----
+
+    #[test]
+    fn overall_timeout_must_be_positive_and_fit_the_clock() {
+        let zero = validate_timeouts(30, Some(0)).unwrap_err();
+        assert!(
+            zero.0.contains("--timeout must be at least 1 second"),
+            "{}",
+            zero.0
+        );
+        let huge = validate_timeouts(30, Some(u64::MAX)).unwrap_err();
+        assert!(huge.0.contains("--timeout"), "{}", huge.0);
+        assert!(
+            huge.0.contains("too large for the host clock"),
+            "{}",
+            huge.0
+        );
+        validate_timeouts(30, Some(1)).unwrap();
+        validate_timeouts(30, Some(600)).unwrap();
+    }
+
+    #[test]
+    fn timeout_flag_is_optional() {
+        let base = ["limits", "--contract", "c.wasm", "--fn", "f", "--ramp", "n"];
+        assert_eq!(LimitsArgs::try_parse_from(base).unwrap().timeout, None);
+        let args =
+            LimitsArgs::try_parse_from(base.iter().copied().chain(["--timeout", "120"])).unwrap();
+        assert_eq!(args.timeout, Some(120));
+    }
+
+    #[test]
+    fn without_an_overall_timeout_probes_get_the_full_per_probe_timeout() {
+        let clock = RunClock::start(None);
+        assert_eq!(
+            clock.probe_wait(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        clock.check(5, Some(3), "f", "n").unwrap();
+    }
+
+    #[test]
+    fn probe_wait_is_clamped_to_the_time_left() {
+        let clock = RunClock::start(Some(Duration::from_secs(2)));
+        let wait = clock.probe_wait(Duration::from_secs(30));
+        assert!(wait <= Duration::from_secs(2), "{wait:?}");
+        // A per-probe timeout shorter than the time left is used as-is.
+        assert_eq!(
+            clock.probe_wait(Duration::from_millis(10)),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_reports_progress_and_how_to_recover() {
+        let clock = RunClock::start(Some(Duration::ZERO));
+        let err = clock
+            .check(7, Some(16), "batch_payout", "recipients")
+            .unwrap_err();
+        assert!(
+            err.0.contains("\"batch_payout\" exceeded --timeout (0ms)"),
+            "{}",
+            err.0
+        );
+        assert!(err.0.contains("after 7 probe(s)"), "{}", err.0);
+        assert!(
+            err.0.contains("highest recipients verified so far is 16"),
+            "{}",
+            err.0
+        );
+        assert!(err.0.contains("boundary was not confirmed"), "{}", err.0);
+        assert!(err.0.contains("Raise --timeout"), "{}", err.0);
+
+        let none = clock.check(1, None, "f", "n").unwrap_err();
+        assert!(
+            none.0.contains("no n value had succeeded yet"),
+            "{}",
+            none.0
+        );
+    }
+
+    #[test]
+    fn a_probe_cut_short_by_the_deadline_ends_the_run_instead_of_counting_as_a_ceiling() {
+        let clock = RunClock::start(None);
+        let timed_out = ProbeOutcome::Failed(ProbeFailureCategory::TimedOut);
+        let err = clock
+            .check_cut_short(
+                timed_out,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                9,
+                4,
+                Some(8),
+                "f",
+                "n",
+            )
+            .unwrap_err();
+        assert!(err.0.contains("while probing n=9"), "{}", err.0);
+        assert!(
+            err.0.contains("highest n verified so far is 8"),
+            "{}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn a_probe_that_used_its_full_timeout_is_a_genuine_timeout() {
+        let clock = RunClock::start(None);
+        let full = Duration::from_secs(30);
+        let timed_out = ProbeOutcome::Failed(ProbeFailureCategory::TimedOut);
+        clock
+            .check_cut_short(timed_out, full, full, 9, 4, Some(8), "f", "n")
+            .unwrap();
+        // Other outcomes are never treated as the deadline, even when clamped.
+        for outcome in [
+            ProbeOutcome::Succeeded,
+            ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure),
+        ] {
+            clock
+                .check_cut_short(
+                    outcome,
+                    Duration::from_secs(1),
+                    full,
+                    9,
+                    4,
+                    Some(8),
+                    "f",
+                    "n",
+                )
+                .unwrap();
+        }
+    }
+
+    // ---- #362: progress updates ----
+
+    #[test]
+    fn progress_line_for_a_successful_scan_probe() {
+        let line = format_progress_line(
+            3,
+            ProbePhase::Scan,
+            "recipients",
+            4,
+            ProbeOutcome::Succeeded,
+            Some(4),
+            Duration::from_millis(1_500),
+        );
+        assert_eq!(
+            line,
+            "limits: probe 3 (scan) recipients=4 ok; best so far: 4; elapsed 1.5s"
+        );
+    }
+
+    #[test]
+    fn progress_line_for_a_failed_refinement_probe() {
+        let line = format_progress_line(
+            9,
+            ProbePhase::Refine,
+            "recipients",
+            48,
+            ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
+            Some(32),
+            Duration::from_secs(12),
+        );
+        assert_eq!(
+            line,
+            "limits: probe 9 (refine) recipients=48 failed [timed-out]; best so far: 32; elapsed 12s"
+        );
+    }
+
+    #[test]
+    fn progress_line_before_any_success() {
+        let line = format_progress_line(
+            1,
+            ProbePhase::Scan,
+            "n",
+            1,
+            ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure),
+            None,
+            Duration::ZERO,
+        );
+        assert!(line.contains("failed [exit-failure]"), "{line}");
+        assert!(line.contains("best so far: none yet"), "{line}");
+    }
+
+    #[test]
+    fn progress_flag_defaults_to_off() {
+        let base = ["limits", "--contract", "c.wasm", "--fn", "f", "--ramp", "n"];
+        assert!(!LimitsArgs::try_parse_from(base).unwrap().progress);
+        assert!(
+            LimitsArgs::try_parse_from(base.iter().copied().chain(["--progress"]))
+                .unwrap()
+                .progress
+        );
+    }
+
+    // ---- #363: last failing probe ----
+
+    fn summary_with_last_failure(stderr: Option<&str>) -> LimitsSummary {
+        LimitsSummary {
+            last_failed_probe: Some(FailedProbe {
+                value: 101,
+                category: ProbeFailureCategory::ExitFailure,
+                stderr: stderr.map(str::to_string),
+            }),
+            ..sample_summary()
+        }
+    }
+
+    #[test]
+    fn text_summary_reports_the_last_failing_probe_next_to_the_maximum_success() {
+        let text = summary_with_last_failure(Some("HostError: budget exceeded")).render_text();
+        let lines: Vec<&str> = text.lines().collect();
+        let best = lines
+            .iter()
+            .position(|l| l.starts_with("last successful"))
+            .unwrap();
+        let last = lines
+            .iter()
+            .position(|l| l.contains("last failing probe:"))
+            .expect("last failing probe line missing");
+        assert!(last > best && last <= best + 4, "{text}");
+        assert_eq!(
+            lines[last],
+            "  last failing probe: recipients=101 [exit-failure]: HostError: budget exceeded"
+        );
+    }
+
+    #[test]
+    fn last_failing_probe_line_keeps_only_the_first_stderr_line() {
+        let text =
+            summary_with_last_failure(Some("\n  panicked at host.rs\nstack backtrace:\n  0: ..."))
+                .render_text();
+        assert!(
+            text.contains("recipients=101 [exit-failure]: panicked at host.rs\n"),
+            "{text}"
+        );
+        assert!(!text.contains("stack backtrace"), "{text}");
+    }
+
+    #[test]
+    fn last_failing_probe_without_stderr_still_reports_value_and_category() {
+        for stderr in [None, Some("   ")] {
+            let text = summary_with_last_failure(stderr).render_text();
+            assert!(
+                text.contains("  last failing probe: recipients=101 [exit-failure]\n"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_last_failing_probe_line_when_nothing_failed() {
+        let text = sample_summary().render_text();
+        assert!(!text.contains("last failing probe"), "{text}");
+    }
+
+    #[test]
+    fn last_failing_probe_round_trips_through_json_and_old_reports_still_parse() {
+        let summary = summary_with_last_failure(Some("budget exceeded"));
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["last_failed_probe"]["value"], 101);
+        assert_eq!(json["last_failed_probe"]["category"], "exit-failure");
+        assert_eq!(json["last_failed_probe"]["stderr"], "budget exceeded");
+        let back: LimitsSummary = serde_json::from_value(json).unwrap();
+        assert_eq!(back, summary);
+
+        // Reports written before this field existed omit it entirely.
+        let mut old = serde_json::to_value(sample_summary()).unwrap();
+        old.as_object_mut().unwrap().remove("last_failed_probe");
+        let parsed: LimitsSummary = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.last_failed_probe, None);
     }
 }

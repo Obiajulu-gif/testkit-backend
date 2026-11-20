@@ -30,6 +30,18 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- `limits --timeout <SECONDS>` bounds the whole run. Probes never wait past
+  the deadline, and a run that hits it fails with the best value verified so
+  far instead of reporting an unconfirmed boundary.
+- `limits --progress` prints one line per probe to stderr while ramping:
+  phase, ramp value, outcome, best value so far and elapsed time.
+- `limits` reports the last failing probe (value, category and first stderr
+  line) next to the maximum success, and as `last_failed_probe` in `--export`
+  JSON.
+- A probe killed by `--probe-timeout` now records which ramp value it was
+  running and the timeout it exceeded, and a `--probe-timeout` the host clock
+  cannot represent is rejected before any probe runs.
+
 - Coverage accepts repeatable `--include`/`--package` and `--exclude` flags
   to select workspace packages for targeted runs.
 

@@ -566,8 +566,10 @@ When cargo-llvm-cov exits non-zero, nothing is deleted. The error lists any outp
 Empirically discovers resource ceilings rather than guessing them.
 
 ```
-soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--arg <name=value> ...] [--jobs <n>]
+soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--arg <name=value> ...] [--jobs <n>] [--probe-timeout <secs>] [--timeout <secs>] [--progress]
 ```
+
+`--probe-timeout <secs>` (default 30) kills any single isolated probe that runs longer and records it as `timed-out`; the report names the ramp value and the timeout. Values the host clock cannot represent are rejected before probing. `--timeout <secs>` (at least 1, off by default) bounds the whole run: each probe waits at most for the time left, and when the deadline passes the command exits non-zero with the best value verified so far, writing no reports, because the boundary was not confirmed. A probe cut short by this deadline is never counted as a resource ceiling. `--progress` writes one line per probe to stderr while ramping; stdout and the `--export` JSON are unchanged. The summary reports the last failing probe (value, category, first stderr line) alongside the maximum success; after refinement this is the value just above it.
 
 `--jobs <n>` (1 to 8, default 1) is opt-in. It probes up to `n` consecutive ramp values concurrently while doubling, and reads results back in ramp order, stopping at the first failure. The reported boundary matches a sequential run. Probes past the first failure still run to completion but are discarded. Binary refinement always runs one probe at a time.
 
